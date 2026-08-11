@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-httpx
-pydantic
-streamlit
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+httpx==0.28.1
+pydantic==2.13.4
+streamlit==1.61.1

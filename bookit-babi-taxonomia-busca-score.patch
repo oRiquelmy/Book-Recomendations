@@ -1,0 +1,3985 @@
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+index feb9842..e0c2dff 100644
+--- a/PATCH_NOTES.md
++++ b/PATCH_NOTES.md
+@@ -24,3 +24,27 @@ python -m pip install -r requirements-dev.txt
+ python -m pytest -q
+ python -m compileall -q .
+ ```
++
++
++## Rodada de taxonomia, busca e afinidade
++
++Esta rodada é incremental sobre o primeiro patch e altera principalmente:
++
++- `taxonomy.py`: taxonomia canônica PT/EN, relações entre categorias e termos de busca
++- `book_profile.py`: sinais temáticos e estilísticos alimentados pela taxonomia
++- `filters.py`: score normalizado pela evidência disponível, com componentes e cobertura
++- `main.py`: busca simultânea nos dois providers, ranking unificado e mesclagem de duplicados
++- `cli.py`: remoção do bloco introdutório, textos redundantes e exibição da afinidade em percentual
++
++O valor de `score` deve ser lido como afinidade relativa com a obra-base, não como probabilidade. O padrão de `BOOKIT_MIN_RECOMMENDATION_SCORE` passa de `0.18` para `0.34` porque a escala foi recalibrada.
++
++A calibração evita dois erros opostos:
++
++- metadados ausentes não são tratados automaticamente como incompatibilidade
++- coincidências editoriais fracas, como idioma, ano, páginas ou apenas `Fiction`/`Nonfiction`, não sustentam uma nota alta
++
++As categorias canônicas agora cobrem gêneros, subgêneros, público, formato e temas frequentes do Google Books/Open Library. Relações de pai/subgênero e famílias específicas são usadas no score e na geração dos termos de busca; rótulos genéricos têm peso reduzido.
++
++`GET /search` aceita ISBN e consulta esse campo diretamente tanto no Google Books quanto na Open Library.
++
++A busca temática não herda mais automaticamente o idioma da obra-base. A preferência só é enviada aos providers quando o filtro correspondente é escolhido pelo usuário; o filtro final continua estrito na aplicação.
+diff --git a/README.md b/README.md
+index 2b2bae2..bb80f15 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,8 @@
+ 
+ Aplicação de descoberta e recomendação de livros com backend em FastAPI, interface em Streamlit e integração com Google Books e Open Library.
+ 
++Versão da API nesta rodada: `0.3.0`.
++
+ ## O que mudou nesta revisão
+ 
+ - busca por **Livro** e **Autor** são fluxos distintos
+@@ -10,11 +12,16 @@ Aplicação de descoberta e recomendação de livros com backend em FastAPI, int
+ - paginação foi adicionada às buscas de livros e autores
+ - o modelo diferencia provider, Work, Edition e ISBNs
+ - deduplicação prioriza ISBN, Work/Edition ID e só depois título + autores normalizados
+-- normalização trata acentos, pontuação, iniciais e aliases comuns de gênero
++- taxonomia canônica PT/EN diferencia gênero, subgênero, público, formato e tema, incluindo categorias frequentes dos providers
++- busca de livros combina Google Books e Open Library, ranqueia o conjunto e mescla metadados duplicados
++- a preferência de idioma só é enviada aos providers quando o usuário a escolhe explicitamente
++- normalização trata acentos, pontuação, iniciais e aliases comuns de categoria
+ - títulos como `Catch-22` e `Spider-Man: Blue` não são mais truncados
+ - matching temático usa palavras/frases, evitando falsos positivos por substring
+ - filtros de páginas e ano excluem metadados desconhecidos por padrão
+-- o score final fica limitado à faixa `0.0` a `1.0`
++- afinidade é calibrada em `0.0` a `1.0` conforme a evidência disponível, sem punir metadados ausentes como incompatibilidade
++- cada recomendação expõe componentes do score e cobertura de metadados para inspeção
++- a interface removeu cards introdutórios e textos explicativos redundantes
+ - clientes HTTP são reaproveitados em vez de recriados a cada chamada
+ - dependências foram fixadas e uma suíte de regressão foi adicionada
+ 
+@@ -60,8 +67,8 @@ Outras opções:
+ | `BOOKIT_CACHE_TTL_SECONDS` | `21600` | TTL do cache em memória |
+ | `BOOKIT_CACHE_MAX_ITEMS` | `512` | Limite de itens em cache |
+ | `BOOKIT_GOOGLE_COOLDOWN_SECONDS` | `900` | Cooldown após quota/indisponibilidade |
+-| `BOOKIT_MIN_RECOMMENDATION_SCORE` | `0.18` | Score mínimo aceito |
+-| `BOOKIT_MAX_SEARCH_TERMS` | `4` | Termos temáticos por recomendação |
++| `BOOKIT_MIN_RECOMMENDATION_SCORE` | `0.34` | Afinidade mínima aceita |
++| `BOOKIT_MAX_SEARCH_TERMS` | `6` | Termos temáticos por recomendação |
+ | `BOOKIT_HTTP_SSL_VERIFY` | `true` | Verificação TLS do backend |
+ 
+ ## Execução
+@@ -104,7 +111,7 @@ Também é possível usar `./start.sh` em ambientes que fornecem a variável `PO
+ 
+ Busca obras-base.
+ 
+-- `q`: título obrigatório
++- `q`: título, termo ou ISBN obrigatório
+ - `author`: desambiguação opcional
+ - `max_results`: `1` a `40`
+ - `offset`: paginação
+@@ -157,7 +164,22 @@ Além dos metadados de exibição, cada livro agora expõe:
+ - `isbn_10[]`
+ - `isbn_13[]`
+ 
+-Esses campos evitam tratar Work, Edition e Volume como se fossem o mesmo identificador.
++Esses campos evitam tratar Work, Edition e Volume como se fossem o mesmo identificador. Quando o mesmo livro aparece nos dois providers, categorias, descrição, capa, ISBNs e demais campos complementares são mesclados.
++
++As recomendações também incluem:
++
++- `score`: afinidade calibrada entre `0.0` e `1.0`; não representa probabilidade
++- `score_components`: similaridade observada em taxonomia, temas, estilo, texto, autor, período, páginas, título e idioma
++- `score_coverage`: fração dos sinais para os quais havia metadado comparável
++
++Faixas usadas na interface e na calibração:
++
++- `0.70–1.00`: afinidade forte
++- `0.50–0.69`: afinidade relevante
++- `0.34–0.49`: resultado exploratório
++- abaixo de `0.34`: descartado por padrão
++
++Categorias amplas como `Fiction`, `Nonfiction`, `General` e `Literature` são evidência fraca. Elas não bastam, sozinhas, para sustentar uma recomendação.
+ 
+ ## Testes
+ 
+@@ -165,11 +187,15 @@ A suíte cobre regressões de:
+ 
+ - acentos, pontuação e nomes com iniciais
+ - preservação de títulos legítimos
+-- aliases de gênero PT/EN
++- aliases de categoria PT/EN e relações entre gênero/subgênero
++- geração de termos canônicos para os providers
++- categorias comuns dos providers, como `Literary Criticism`, `Health & Fitness`, `Family & Relationships` e `Body, Mind & Spirit`
+ - falsos temas causados por substrings
+ - filtros com metadados desconhecidos
+-- score normalizado
++- calibração de afinidade para livros fortes, fracos e com metadados esparsos
++- componentes e cobertura do score
+ - parsing de Work/Edition/ISBN
+-- deduplicação entre providers
++- busca combinada e mesclagem de metadados entre providers
++- busca por ISBN nos dois providers
+ - rejeição de recomendação somente por autor
+ - paginação do Google Books por `startIndex`
+diff --git a/book_profile.py b/book_profile.py
+index 5d43103..133b6a6 100644
+--- a/book_profile.py
++++ b/book_profile.py
+@@ -3,6 +3,7 @@ from dataclasses import dataclass
+ 
+ from metadata_normalizer import contains_normalized_phrase, normalize_text, tokenize_text
+ from models import BookResponse
++from taxonomy import taxonomy_profile
+ 
+ _STOPWORDS = {
+     "about",
+@@ -96,7 +97,7 @@ _THEME_KEYWORDS = {
+     },
+     "politics": {
+         "activism", "ativismo", "estado", "government", "governo", "politica",
+-        "political", "politics", "power", "poder", "revolution", "revolucao", "state",
++        "political", "politics", "revolution", "revolucao", "state",
+     },
+     "social_critique": {
+         "bourgeois", "burguesia", "capitalism", "capitalismo", "class inequality",
+@@ -120,7 +121,7 @@ _THEME_KEYWORDS = {
+         "psychological", "psychology", "psicologico", "psyche", "trauma",
+     },
+     "history": {
+-        "era", "historical", "historico", "historia", "history", "period drama",
++        "historical", "historico", "historia", "history", "period drama",
+         "period piece",
+     },
+     "war": {
+@@ -148,7 +149,7 @@ _THEME_KEYWORDS = {
+     },
+     "science": {
+         "astronomy", "biology", "ciencia", "cientifico", "experiment", "mathematics",
+-        "physics", "pesquisa", "research", "science", "scientific",
++        "physics", "science", "scientific",
+     },
+     "religion": {
+         "church", "faith", "god", "mythology", "religiao", "religion", "sacred", "spiritual",
+@@ -175,8 +176,8 @@ _NARRATIVE_KEYWORDS = {
+ 
+ _CATEGORY_KIND_KEYWORDS = {
+     "literary_fiction": {
+-        "classic fiction", "classics", "contemporary fiction", "fiction", "literary", "literary fiction",
+-        "literature", "novel", "romance",
++        "classic fiction", "classics", "contemporary literary fiction", "literary",
++        "literary fiction", "literature",
+     },
+     "genre_fiction": {
+         "crime fiction", "fantasy", "ficcao cientifica", "ficcao especulativa", "horror",
+@@ -214,6 +215,61 @@ _SERIES_TERMS = {
+     "book", "livro", "volume", "vol", "part", "parte", "series", "serie", "saga", "chronicles",
+ }
+ 
++_THEME_BY_TAXON = {
++    "adventure": "adventure",
++    "fantasy": "fantasy",
++    "epic_fantasy": "fantasy",
++    "dark_fantasy": "fantasy",
++    "urban_fantasy": "fantasy",
++    "magical_realism": "fantasy",
++    "science_fiction": "science_fiction",
++    "space_opera": "science_fiction",
++    "cyberpunk": "technology",
++    "dystopia": "dystopia",
++    "romance": "love",
++    "historical_romance": "love",
++    "contemporary_romance": "love",
++    "paranormal_romance": "love",
++    "mystery": "mystery",
++    "crime_fiction": "mystery",
++    "thriller": "mystery",
++    "psychological_thriller": "psychology",
++    "cozy_mystery": "mystery",
++    "western": "adventure",
++    "history": "history",
++    "philosophy": "philosophy",
++    "psychology": "psychology",
++    "science": "science",
++    "technology": "technology",
++    "politics": "politics",
++    "religion": "religion",
++    "spirituality": "religion",
++    "social_science": "social_critique",
++    "law": "politics",
++    "nature_environment": "science",
++    "mythology_folklore": "religion",
++    "family_relationships": "family",
++}
++
++_GENRE_FICTION_TAXONS = {
++    "fantasy", "epic_fantasy", "dark_fantasy", "urban_fantasy", "magical_realism",
++    "science_fiction", "space_opera", "cyberpunk", "dystopia", "romance",
++    "historical_romance", "contemporary_romance", "paranormal_romance", "mystery",
++    "crime_fiction", "thriller", "psychological_thriller", "cozy_mystery",
++    "horror", "gothic", "adventure", "humor", "western",
++}
++_LITERARY_TAXONS = {"literary_fiction", "historical_fiction", "classics", "short_stories"}
++_TECHNICAL_TAXONS = {"science", "technology", "mathematics", "health_medicine"}
++_NONFICTION_TAXONS = {
++    "biography", "memoir", "history", "philosophy", "psychology", "self_help",
++    "nonfiction", "business", "economics", "science", "technology", "politics", "religion",
++    "spirituality",
++    "true_crime", "social_science", "education", "law", "health_medicine",
++    "mathematics", "nature_environment", "cooking", "travel", "art_design",
++    "music", "sports", "crafts_hobbies", "language_linguistics", "parenting",
++    "family_relationships", "literary_criticism", "reference", "mythology_folklore", "essays",
++}
++
+ 
+ @dataclass(frozen=True)
+ class BookProfile:
+@@ -286,21 +342,53 @@ def _match_labels(corpus: str, mapping: dict[str, set[str]]) -> frozenset[str]:
+ 
+ def extract_book_profile(book: BookResponse) -> BookProfile:
+     corpus = normalize_text(_build_corpus(book))
++    taxonomy = taxonomy_profile(book.categories)
++
++    themes = set(_match_labels(corpus, _THEME_KEYWORDS))
++    for taxon_id in taxonomy.all_ids:
++        mapped_theme = _THEME_BY_TAXON.get(taxon_id)
++        if mapped_theme:
++            themes.add(mapped_theme)
++
++    category_kinds = set(_match_labels(corpus, _CATEGORY_KIND_KEYWORDS))
++    if taxonomy.all_ids & _GENRE_FICTION_TAXONS:
++        category_kinds.add("genre_fiction")
++    if taxonomy.all_ids & _LITERARY_TAXONS:
++        category_kinds.add("literary_fiction")
++    if taxonomy.all_ids & _NONFICTION_TAXONS:
++        category_kinds.add("nonfiction")
++    if taxonomy.all_ids & _TECHNICAL_TAXONS:
++        category_kinds.add("technical")
++
++    audiences = set(_match_labels(corpus, _AUDIENCE_KEYWORDS))
++    if "young_adult" in taxonomy.audience:
++        audiences.add("young_adult")
++    if "children" in taxonomy.audience:
++        audiences.add("children")
++
+     return BookProfile(
+-        themes=_match_labels(corpus, _THEME_KEYWORDS),
++        themes=frozenset(themes),
+         tones=_match_labels(corpus, _TONE_KEYWORDS),
+         narrative_markers=_match_labels(corpus, _NARRATIVE_KEYWORDS),
+-        category_kinds=_match_labels(corpus, _CATEGORY_KIND_KEYWORDS),
+-        audiences=_match_labels(corpus, _AUDIENCE_KEYWORDS),
++        category_kinds=frozenset(category_kinds),
++        audiences=frozenset(audiences),
+         pace_markers=_match_labels(corpus, _PACE_KEYWORDS),
+         keywords=_extract_keywords(book),
+     )
+ 
+ 
+ def _set_overlap(left: frozenset[str], right: frozenset[str]) -> float:
++    """Compara conjuntos esparsos sem a penalidade excessiva do Jaccard puro."""
+     if not left or not right:
+         return 0.0
+-    return len(left & right) / len(left | right)
++
++    intersection = len(left & right)
++    if not intersection:
++        return 0.0
++
++    overlap = intersection / min(len(left), len(right))
++    dice = (2 * intersection) / (len(left) + len(right))
++    return 0.65 * overlap + 0.35 * dice
+ 
+ 
+ def profile_component_scores(reference: BookProfile, candidate: BookProfile) -> dict[str, float]:
+diff --git a/cli.py b/cli.py
+index 1939dfa..22554f0 100644
+--- a/cli.py
++++ b/cli.py
+@@ -4,27 +4,11 @@ from html import escape
+ import httpx
+ import streamlit as st
+ 
++from taxonomy import category_options
++
+ BASE_URL = os.getenv("BOOKIT_BASE_URL", "http://localhost:8000")
+ REQUEST_TIMEOUT_SECONDS = float(os.getenv("BOOKIT_REQUEST_TIMEOUT_SECONDS", "30"))
+-COMMON_GENRES = [
+-    "",
+-    "Fiction",
+-    "Fantasy",
+-    "Science Fiction",
+-    "Romance",
+-    "Mystery",
+-    "Thriller",
+-    "Horror",
+-    "Young Adult",
+-    "Historical Fiction",
+-    "Biography",
+-    "History",
+-    "Philosophy",
+-    "Self-Help",
+-    "Business",
+-    "Psychology",
+-    "Poetry",
+-]
++CATEGORY_OPTIONS = ["", *category_options()]
+ LANGUAGE_OPTIONS = {
+     "": "Qualquer idioma",
+     "pt": "Português",
+@@ -59,6 +43,7 @@ PAGE_RANGE_MIN = 0
+ PAGE_RANGE_MAX = 1500
+ PAGE_RANGE_STEP = 100
+ DEFAULT_RECOMMENDATION_LIMIT = 5
++BOOK_SEARCH_PAGE_SIZE = 8
+ 
+ 
+ def format_language_label(language_code: str | None) -> str:
+@@ -117,7 +102,7 @@ def format_page_range_value(value: int) -> str:
+ def get_active_filter_labels(filters: dict) -> list[str]:
+     labels: list[str] = []
+     if filters.get("category"):
+-        labels.append(f"Gênero: {filters['category']}")
++        labels.append(f"Categoria: {filters['category']}")
+     if filters.get("language"):
+         labels.append(f"Idioma: {format_language_label(filters['language'])}")
+     if filters.get("min_pages") or filters.get("max_pages"):
+@@ -136,36 +121,46 @@ def get_active_filter_labels(filters: dict) -> list[str]:
+ 
+ 
+ def build_match_reasons(book: dict, reference: dict | None = None) -> list[str]:
+-    reasons: list[str] = []
++    components = book.get("score_components") or {}
++    if components:
++        reasons: list[str] = []
++        taxonomy_score = components.get("taxonomy", 0.0)
++        if taxonomy_score >= 0.85:
++            reasons.append("Categoria ou subgênero muito próximo")
++        elif taxonomy_score >= 0.55:
++            reasons.append("Categoria relacionada")
++
++        themes_score = components.get("themes", 0.0)
++        if themes_score >= 0.65:
++            reasons.append("Temas muito próximos")
++        elif themes_score >= 0.40:
++            reasons.append("Temas em comum")
++
++        if components.get("style", 0.0) >= 0.65:
++            reasons.append("Estilo narrativo semelhante")
++        if components.get("text", 0.0) >= 0.45:
++            reasons.append("Descrição e vocabulário próximos")
++        if components.get("author", 0.0) >= 0.95:
++            reasons.append("Mesmo autor")
++        if components.get("year", 0.0) >= 0.85:
++            reasons.append("Período próximo")
++        if components.get("pages", 0.0) >= 0.85:
++            reasons.append("Extensão parecida")
++        return reasons[:3]
++
+     if not reference:
+-        return reasons
++        return []
+ 
++    reasons: list[str] = []
+     reference_categories = {category.casefold() for category in reference.get("categories", []) if category}
+     book_categories = {category.casefold() for category in book.get("categories", []) if category}
+-    if reference_categories and book_categories and reference_categories & book_categories:
+-        reasons.append("Compartilha gênero com a obra-base")
++    if reference_categories & book_categories:
++        reasons.append("Categoria em comum")
+ 
+     reference_authors = {author.casefold() for author in reference.get("authors", []) if author}
+     book_authors = {author.casefold() for author in book.get("authors", []) if author}
+-    if reference_authors and book_authors and reference_authors & book_authors:
++    if reference_authors & book_authors:
+         reasons.append("Mesmo autor")
+-
+-    if reference.get("language") and book.get("language"):
+-        if format_language_label(reference.get("language")) == format_language_label(book.get("language")):
+-            reasons.append(f"Mesmo idioma: {format_language_label(book.get('language'))}")
+-
+-    if reference.get("published_year") and book.get("published_year"):
+-        difference = abs(reference["published_year"] - book["published_year"])
+-        if difference <= 5:
+-            reasons.append("Período muito próximo")
+-        elif difference <= 15:
+-            reasons.append("Período semelhante")
+-
+-    if reference.get("page_count") and book.get("page_count"):
+-        difference = abs(reference["page_count"] - book["page_count"])
+-        if difference <= 80:
+-            reasons.append("Extensão parecida")
+-
+     return reasons[:3]
+ 
+ 
+@@ -179,70 +174,6 @@ def apply_page_styles() -> None:
+                     radial-gradient(circle at top right, rgba(108, 128, 109, 0.10), transparent 28%);
+             }
+ 
+-            .hero-block {
+-                margin: 0.4rem 0 1rem 0;
+-                padding: 1.2rem 1.25rem;
+-                border-radius: 22px;
+-                background: linear-gradient(135deg, rgba(94, 74, 58, 0.94), rgba(38, 54, 44, 0.92));
+-                border: 1px solid rgba(201, 166, 126, 0.28);
+-                box-shadow: 0 18px 50px rgba(35, 28, 24, 0.18);
+-                color: #f6f0e7;
+-            }
+-
+-            .hero-kicker {
+-                display: inline-block;
+-                padding: 0.24rem 0.62rem;
+-                border-radius: 999px;
+-                font-size: 0.72rem;
+-                font-weight: 700;
+-                letter-spacing: 0.04em;
+-                text-transform: uppercase;
+-                background: rgba(230, 204, 170, 0.16);
+-                color: #f3ddbf;
+-                margin-bottom: 0.75rem;
+-            }
+-
+-            .hero-title {
+-                font-size: 2rem;
+-                line-height: 1.1;
+-                font-weight: 700;
+-                margin-bottom: 0.4rem;
+-            }
+-
+-            .hero-copy {
+-                font-size: 1rem;
+-                line-height: 1.6;
+-                max-width: 900px;
+-                color: rgba(246, 240, 231, 0.88);
+-            }
+-
+-            .chip-grid {
+-                display: grid;
+-                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+-                gap: 0.8rem;
+-                margin: 1rem 0 1.1rem 0;
+-            }
+-
+-            .chip-card {
+-                padding: 0.95rem 1rem;
+-                border-radius: 18px;
+-                border: 1px solid rgba(126, 99, 76, 0.18);
+-                background: linear-gradient(180deg, rgba(255, 250, 244, 0.82), rgba(247, 239, 228, 0.70));
+-                backdrop-filter: blur(6px);
+-            }
+-
+-            .chip-card strong {
+-                display: block;
+-                font-size: 0.95rem;
+-                margin-bottom: 0.18rem;
+-                color: #4f3f34;
+-            }
+-
+-            .chip-card span {
+-                color: rgba(79, 63, 52, 0.82);
+-                font-size: 0.92rem;
+-            }
+-
+             .section-card {
+                 padding: 1.05rem 1.1rem 1.15rem 1.1rem;
+                 border-radius: 20px;
+@@ -272,12 +203,6 @@ def apply_page_styles() -> None:
+                 margin-bottom: 0.2rem;
+             }
+ 
+-            .section-copy {
+-                color: rgba(63, 51, 43, 0.82);
+-                font-size: 0.94rem;
+-                line-height: 1.55;
+-                margin-bottom: 0.2rem;
+-            }
+ 
+             .result-card {
+                 padding: 1rem 1rem 1.05rem 1rem;
+@@ -573,60 +498,43 @@ def get_author_works(author_id: str, author_name: str, limit: int = 24, offset:
+     )
+     return payload if isinstance(payload, list) else []
+ 
++def _reference_candidate_key(book: dict) -> str:
++    isbn_13 = next((value for value in book.get("isbn_13", []) if value), "")
++    if isbn_13:
++        return f"isbn13:{isbn_13}"
++    if book.get("work_id"):
++        return f"work:{book['work_id']}"
++    return f"{book.get('provider', 'unknown')}:{book.get('id', '')}"
++
++
++def merge_reference_candidate_pages(existing: list[dict], incoming: list[dict]) -> list[dict]:
++    merged = list(existing)
++    seen = {_reference_candidate_key(book) for book in existing}
++    for book in incoming:
++        key = _reference_candidate_key(book)
++        if not key or key in seen:
++            continue
++        seen.add(key)
++        merged.append(book)
++    return merged
++
++
+ def clear_reference_candidates() -> None:
+     st.session_state["reference_candidates"] = []
+     st.session_state["reference_query"] = ""
++    st.session_state["reference_offset"] = 0
++    st.session_state["reference_has_more"] = False
+     st.session_state["selected_reference_id"] = ""
+ 
+-def render_intro() -> None:
+-    st.markdown(
+-        """
+-        <div class="hero-block">
+-            <div class="hero-kicker">Recomendações literárias</div>
+-            <div class="hero-title">Encontre sua próxima leitura a partir de uma obra que você escolheu.</div>
+-            <div class="hero-copy">
+-                A busca por livro identifica a obra-base. A busca por autor resolve primeiro a pessoa e sua
+-                bibliografia, sem transformar silenciosamente o primeiro resultado em referência.
+-            </div>
+-        </div>
+-        """,
+-        unsafe_allow_html=True,
+-    )
+ 
+-    st.markdown(
+-        """
+-        <div class="chip-grid">
+-            <div class="chip-card">
+-                <strong>Livro e autor separados</strong>
+-                <span>Cada modo usa uma entidade e uma intenção de busca explícitas.</span>
+-            </div>
+-            <div class="chip-card">
+-                <strong>Obra-base confirmada</strong>
+-                <span>Escolha a edição ou obra correta antes de calcular similaridade.</span>
+-            </div>
+-            <div class="chip-card">
+-                <strong>Filtros previsíveis</strong>
+-                <span>Metadados ausentes são excluídos de filtros numéricos por padrão.</span>
+-            </div>
+-            <div class="chip-card">
+-                <strong>Gêneros normalizados</strong>
+-                <span>Aliases comuns em português e inglês reduzem perdas de resultado.</span>
+-            </div>
+-        </div>
+-        """,
+-        unsafe_allow_html=True,
+-    )
+-
+-def render_section_header(kicker: str, title: str, copy: str) -> None:
++def render_section_header(kicker: str, title: str) -> None:
+     safe_kicker = escape(kicker)
+     safe_title = escape(title)
+-    safe_copy = escape(copy)
+     st.markdown(
+         f"""
+         <div class="section-card">
+             <div class="section-kicker">{safe_kicker}</div>
+             <div class="section-title">{safe_title}</div>
+-            <div class="section-copy">{safe_copy}</div>
+         </div>
+         """,
+         unsafe_allow_html=True,
+@@ -647,20 +555,16 @@ def render_filter_summary(filters: dict) -> None:
+ 
+ def build_filters() -> dict:
+     with st.expander("Filtros de recomendação", expanded=False):
+-        st.caption("Ajuste idioma, década, faixa de páginas e afinidade com o autor.")
+-
+         top_left, top_right = st.columns([1.6, 1], gap="large")
+         with top_left:
+-            selected_genre = st.selectbox(
+-                "Gênero literário",
+-                options=COMMON_GENRES,
++            selected_category = st.selectbox(
++                "Gênero ou tema",
++                options=CATEGORY_OPTIONS,
+                 index=0,
+-                help="Você pode digitar para localizar opções dentro do dropdown.",
+             )
+-            custom_genre = st.text_input(
+-                "Ou digite um gênero",
++            custom_category = st.text_input(
++                "Ou digite uma categoria",
+                 placeholder="Ex.: fantasia sombria, romance, filosofia",
+-                help="Se preenchido, este texto tem prioridade sobre o gênero sugerido.",
+             )
+         with top_right:
+             limit = st.number_input(
+@@ -678,27 +582,20 @@ def build_filters() -> dict:
+                 options=list(LANGUAGE_OPTIONS.keys()),
+                 format_func=lambda code: LANGUAGE_OPTIONS[code],
+                 index=0,
+-                help="Filtra os resultados para o idioma escolhido.",
+             )
+             selected_decade = st.selectbox(
+                 "Década preferida",
+                 options=list(DECADE_OPTIONS.keys()),
+                 format_func=lambda value: DECADE_OPTIONS[value],
+                 index=0,
+-                help="Prefira obras publicadas em uma década específica.",
+             )
+             exclude_same_author = st.checkbox(
+                 "Ignorar obras do mesmo autor",
+                 value=False,
+-                help="Evita que as recomendações sejam dominadas por outros livros do mesmo autor.",
+             )
+             include_unknown_metadata = st.checkbox(
+                 "Manter livros sem páginas ou ano informados",
+                 value=False,
+-                help=(
+-                    "Por padrão, um filtro de páginas/ano exclui livros que não possuem esse metadado. "
+-                    "Ative esta opção para usar uma política mais permissiva."
+-                ),
+             )
+         with col2:
+             page_range = st.select_slider(
+@@ -706,10 +603,9 @@ def build_filters() -> dict:
+                 options=list(range(PAGE_RANGE_MIN, PAGE_RANGE_MAX + PAGE_RANGE_STEP, PAGE_RANGE_STEP)),
+                 value=(PAGE_RANGE_MIN, PAGE_RANGE_MAX),
+                 format_func=format_page_range_value,
+-                help="Refine a extensão das obras em passos de 100 páginas.",
+             )
+ 
+-    genre = custom_genre.strip() or selected_genre.strip()
++    category = custom_category.strip() or selected_category.strip()
+     min_year, max_year = decade_to_year_bounds(selected_decade)
+     min_pages = page_range[0] if page_range[0] > PAGE_RANGE_MIN else None
+     max_pages = page_range[1] if page_range[1] < PAGE_RANGE_MAX else None
+@@ -726,8 +622,8 @@ def build_filters() -> dict:
+         filters["max_year"] = max_year
+     if selected_decade:
+         filters["decade"] = selected_decade
+-    if genre:
+-        filters["category"] = genre
++    if category:
++        filters["category"] = category
+     if selected_language:
+         filters["language"] = selected_language
+     if exclude_same_author:
+@@ -757,7 +653,7 @@ def render_book_card(
+             st.caption(f"Recomendação {position}")
+         if show_score and isinstance(book.get("score"), (int, float)):
+             st.markdown(
+-                f'<div class="score-pill">Score {book["score"]:.2f}</div>',
++                f'<div class="score-pill">Afinidade {book["score"]:.0%}</div>',
+                 unsafe_allow_html=True,
+             )
+         st.subheader(book.get("title") or "Sem título")
+@@ -775,7 +671,7 @@ def render_book_card(
+             f"""
+             <div class="meta-row">
+                 <div class="meta-pill">Autores: {authors}</div>
+-                <div class="meta-pill">Gênero: {categories}</div>
++                <div class="meta-pill">Categorias: {categories}</div>
+                 <div class="meta-pill">Idioma: {language}</div>
+                 <div class="meta-pill">{pages}</div>
+                 <div class="meta-pill">{year}</div>
+@@ -789,6 +685,7 @@ def render_book_card(
+ 
+     st.markdown("</div>", unsafe_allow_html=True)
+ 
++
+ def render_reference_shelf(candidates: list[dict]) -> dict | None:
+     if not candidates:
+         return None
+@@ -850,10 +747,12 @@ def render_cover_image(book: dict, frame_class: str, empty_class: str) -> None:
+     title = escape(book.get("title", "Livro"), quote=True)
+     if thumbnail:
+         safe_thumbnail = escape(thumbnail, quote=True)
+-        st.markdown(
+-            f'<div class="{frame_class}"><img src="{safe_thumbnail}" alt="Capa de {title}" loading="lazy" referrerpolicy="no-referrer"></div>',
+-            unsafe_allow_html=True,
++        image_markup = (
++            f'<div class="{frame_class}"><img src="{safe_thumbnail}" '
++            f'alt="Capa de {title}" loading="lazy" '
++            'referrerpolicy="no-referrer"></div>'
+         )
++        st.markdown(image_markup, unsafe_allow_html=True)
+         return
+ 
+     st.markdown(
+@@ -866,6 +765,8 @@ def initialize_session_state() -> None:
+     defaults = {
+         "reference_candidates": [],
+         "reference_query": "",
++        "reference_offset": 0,
++        "reference_has_more": False,
+         "selected_reference_id": "",
+         "author_candidates": [],
+         "author_query": "",
+@@ -882,18 +783,10 @@ def render_recommendation_results(data: dict, filters: dict) -> None:
+     recommendations = data["recommendations"]
+ 
+     render_filter_summary(filters)
+-    render_section_header(
+-        "Referência",
+-        "Obra usada como base",
+-        "Esta obra foi escolhida explicitamente antes do cálculo de similaridade.",
+-    )
++    render_section_header("Referência", "Obra usada como base")
+     render_book_card(reference)
+ 
+-    render_section_header(
+-        "Resultados",
+-        f"{len(recommendations)} recomendações encontradas",
+-        "Os resultados foram filtrados e ordenados por similaridade normalizada.",
+-    )
++    render_section_header("Resultados", f"{len(recommendations)} recomendações encontradas")
+     if not recommendations:
+         st.info("Nenhum resultado encontrado com os filtros aplicados.")
+         return
+@@ -903,17 +796,13 @@ def render_recommendation_results(data: dict, filters: dict) -> None:
+ 
+ 
+ def render_book_search_mode() -> None:
+-    render_section_header(
+-        "Livro",
+-        "Localize e confirme a obra-base",
+-        "O autor é opcional e serve apenas para desambiguar títulos, traduções e edições.",
+-    )
++    render_section_header("Livro", "Buscar livro")
+ 
+     with st.form("book-search-form"):
+         input_col1, input_col2 = st.columns(2, gap="large")
+         with input_col1:
+             title = st.text_input(
+-                "Título do livro",
++                "Título ou ISBN",
+                 placeholder="Ex.: Duna, 1984, O Hobbit, No Longer Human",
+                 key="book_title_input",
+             )
+@@ -923,7 +812,7 @@ def render_book_search_mode() -> None:
+                 placeholder="Ex.: Frank Herbert, George Orwell",
+                 key="book_author_input",
+             )
+-        submitted = st.form_submit_button("Encontrar obra-base", width="stretch")
++        submitted = st.form_submit_button("Buscar livros", width="stretch")
+ 
+     current_query = f"{title.strip()}::{author.strip()}"
+     if current_query != st.session_state.get("reference_query") and not submitted:
+@@ -931,28 +820,43 @@ def render_book_search_mode() -> None:
+ 
+     if submitted:
+         if not title.strip():
+-            st.warning("Informe um título. Para procurar uma pessoa e sua bibliografia, use o modo Autor.")
++            st.warning("Informe um título ou ISBN.")
+             clear_reference_candidates()
+         else:
+-            with st.spinner("Buscando obras para confirmar a referência..."):
+-                candidates = search_reference_books(title.strip(), author.strip(), max_results=8)
++            with st.spinner("Buscando livros..."):
++                candidates = search_reference_books(
++                    title.strip(),
++                    author.strip(),
++                    max_results=BOOK_SEARCH_PAGE_SIZE,
++                )
+             st.session_state["reference_candidates"] = candidates
+             st.session_state["reference_query"] = current_query
++            st.session_state["reference_offset"] = BOOK_SEARCH_PAGE_SIZE
++            st.session_state["reference_has_more"] = bool(candidates)
+             st.session_state["selected_reference_id"] = ""
+ 
+     candidates = st.session_state.get("reference_candidates", [])
+     if not candidates:
+-        st.info("Informe um título e clique em `Encontrar obra-base`.")
+         return
+ 
+-    render_section_header(
+-        "Referência",
+-        "Confirme a obra correta",
+-        "A seleção explícita evita que o primeiro resultado da API seja usado sem confirmação.",
+-    )
++    if st.session_state.get("reference_has_more"):
++        if st.button("Carregar mais resultados", width="stretch"):
++            offset = int(st.session_state.get("reference_offset", BOOK_SEARCH_PAGE_SIZE))
++            with st.spinner("Buscando mais livros..."):
++                incoming = search_reference_books(
++                    title.strip(),
++                    author.strip(),
++                    max_results=BOOK_SEARCH_PAGE_SIZE,
++                    offset=offset,
++                )
++            candidates = merge_reference_candidate_pages(candidates, incoming)
++            st.session_state["reference_candidates"] = candidates
++            st.session_state["reference_offset"] = offset + BOOK_SEARCH_PAGE_SIZE
++            st.session_state["reference_has_more"] = bool(incoming)
++
++    render_section_header("Referência", "Escolha a obra")
+     selected_reference = render_reference_shelf(candidates)
+     if not selected_reference:
+-        st.info("Selecione uma das obras acima para configurar as recomendações.")
+         return
+ 
+     filters = build_filters()
+@@ -973,11 +877,7 @@ def render_book_search_mode() -> None:
+ 
+ 
+ def render_author_search_mode() -> None:
+-    render_section_header(
+-        "Autor",
+-        "Encontre a pessoa antes de escolher uma obra",
+-        "Este modo consulta entidades de autor e depois carrega a bibliografia correspondente.",
+-    )
++    render_section_header("Autor", "Buscar autor")
+ 
+     with st.form("author-search-form"):
+         query = st.text_input(
+@@ -1005,7 +905,6 @@ def render_author_search_mode() -> None:
+ 
+     authors = st.session_state.get("author_candidates", [])
+     if not authors:
+-        st.info("Pesquise um autor para consultar a bibliografia sem misturá-la à busca por título.")
+         return
+ 
+     author_by_id = {author["id"]: author for author in authors if author.get("id")}
+@@ -1048,11 +947,9 @@ def render_author_search_mode() -> None:
+     render_section_header(
+         "Bibliografia",
+         f'{len(works)} obras de {selected_author.get("name", "Autor")}',
+-        "Escolha uma obra concreta caso queira usá-la como base de recomendação.",
+     )
+     selected_work = render_reference_shelf(works)
+     if not selected_work:
+-        st.info("Selecione uma obra da bibliografia para gerar recomendações.")
+         return
+ 
+     filters = build_filters()
+@@ -1083,7 +980,6 @@ def main() -> None:
+     st.caption("Por Babi :)")
+     apply_page_styles()
+     initialize_session_state()
+-    render_intro()
+ 
+     search_mode = st.radio(
+         "O que você quer buscar?",
+diff --git a/filters.py b/filters.py
+index 26e7f18..b329a0e 100644
+--- a/filters.py
++++ b/filters.py
+@@ -1,4 +1,8 @@
++from __future__ import annotations
++
++import math
+ from collections import Counter
++from typing import Optional
+ 
+ from book_profile import extract_book_profile, profile_component_scores
+ from metadata_normalizer import (
+@@ -10,6 +14,7 @@ from metadata_normalizer import (
+     tokenize_text,
+ )
+ from models import BookResponse, ScoredBook
++from taxonomy import taxonomy_profile, taxonomy_similarity
+ 
+ _STOPWORDS = {
+     "de", "a", "o", "e", "em", "um", "uma", "para", "com", "que", "do", "da",
+@@ -18,7 +23,7 @@ _STOPWORDS = {
+     "the", "an", "of", "in", "and", "to", "is", "it", "this", "that", "his", "her",
+     "with", "for", "on", "are", "was", "he", "she", "at", "be", "have", "from",
+     "not", "but", "they", "their", "when", "who", "which", "book", "livro", "story",
+-    "historia", "novel", "romance",
++    "historia", "novel", "romance", "edition", "edicao", "volume", "collection",
+ }
+ 
+ _GENERIC_CATEGORY_TERMS = {
+@@ -31,35 +36,32 @@ _GENERIC_CATEGORY_TERMS = {
+     "books",
+ }
+ 
+-# Os pesos base somam 0.74. O perfil temático varia de 0.18 a 0.26,
+-# portanto o score bruto máximo permanece em 1.0 antes das penalidades.
+-_WEIGHT_CATEGORY = 0.18
+-_WEIGHT_AUTHOR = 0.10
+-_WEIGHT_PAGES = 0.08
+-_WEIGHT_YEAR = 0.06
+-_WEIGHT_LANGUAGE = 0.06
+-_WEIGHT_TITLE = 0.12
+-_WEIGHT_DESCRIPTION = 0.10
+-_WEIGHT_SPECIFICITY = 0.04
+-_WEIGHT_THEME = 0.18
+-
+-_PENALTY_NO_PAGES = 0.04
+-_PENALTY_NO_YEAR = 0.02
+-_PENALTY_GENERIC_ONLY = 0.04
+-
+-_PROFILE_COMPONENT_WEIGHTS = {
+-    "themes": 0.36,
+-    "narrative_markers": 0.18,
+-    "category_kinds": 0.18,
+-    "tones": 0.10,
+-    "audiences": 0.08,
+-    "pace_markers": 0.04,
+-    "keywords": 0.06,
++# O score final é uma compatibilidade calibrada, não a soma bruta dos sinais.
++# Componentes ausentes não valem zero; o denominador usa somente evidência disponível,
++# com um piso para impedir notas altas baseadas apenas em idioma, páginas ou ano.
++_SCORE_WEIGHTS = {
++    "taxonomy": 0.38,
++    "themes": 0.22,
++    "style": 0.12,
++    "text": 0.14,
++    "author": 0.07,
++    "year": 0.03,
++    "pages": 0.015,
++    "title": 0.015,
++    "language": 0.01,
++}
++_MIN_EVIDENCE_WEIGHT = 0.72
++_CALIBRATION_EXPONENT = 0.70
++
++_STYLE_COMPONENT_WEIGHTS = {
++    "narrative_markers": 0.36,
++    "tones": 0.30,
++    "audiences": 0.24,
++    "pace_markers": 0.10,
+ }
+ 
+ 
+ def keywords_from_description(description: str, top_n: int = 3) -> list[str]:
+-    """Extrai keywords normalizadas sem separar formas acentuadas e não acentuadas."""
+     words = [
+         token
+         for token in tokenize_text(description)
+@@ -69,106 +71,224 @@ def keywords_from_description(description: str, top_n: int = 3) -> list[str]:
+     return [word for word, _ in frequencies.most_common(top_n)]
+ 
+ 
+-def token_similarity(a: str, b: str) -> float:
+-    tokens_a = {token for token in tokenize_text(a) if len(token) >= 3}
+-    tokens_b = {token for token in tokenize_text(b) if len(token) >= 3}
+-    if not tokens_a or not tokens_b:
++def _token_counter(value: str) -> Counter[str]:
++    return Counter(
++        token
++        for token in tokenize_text(value)
++        if len(token) >= 3 and token not in _STOPWORDS and not token.isdigit()
++    )
++
++
++def _cosine_similarity(left: Counter[str], right: Counter[str]) -> float:
++    if not left or not right:
++        return 0.0
++    common = set(left) & set(right)
++    numerator = sum(left[token] * right[token] for token in common)
++    left_norm = math.sqrt(sum(value * value for value in left.values()))
++    right_norm = math.sqrt(sum(value * value for value in right.values()))
++    if not left_norm or not right_norm:
+         return 0.0
+-    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
++    return numerator / (left_norm * right_norm)
++
++
++def token_similarity(a: str, b: str) -> float:
++    return _cosine_similarity(_token_counter(a), _token_counter(b))
++
++
++def _book_keyword_counter(book: BookResponse) -> Counter[str]:
++    counter: Counter[str] = Counter()
++    weighted_sources = (
++        (book.title or "", 2),
++        (book.description or "", 1),
++    )
++    for text, weight in weighted_sources:
++        for token, count in _token_counter(text).items():
++            counter[token] += count * weight
++    return counter
+ 
+ 
+ def keyword_overlap_score(reference: BookResponse, book: BookResponse) -> float:
+-    ref_keywords = set(keywords_from_description(reference.description, top_n=8))
+-    book_keywords = set(keywords_from_description(book.description, top_n=8))
+-    if not ref_keywords or not book_keywords:
+-        return 0.0
+-    return len(ref_keywords & book_keywords) / len(ref_keywords | book_keywords)
++    return _cosine_similarity(_book_keyword_counter(reference), _book_keyword_counter(book))
+ 
+ 
+-def category_overlap_score(reference_categories: list[str], candidate_categories: list[str]) -> float:
+-    reference = [category for category in reference_categories if normalize_text(category)]
+-    candidates = [category for category in candidate_categories if normalize_text(category)]
++def _raw_category_similarity(reference_categories: list[str], candidate_categories: list[str]) -> float:
++    reference = {normalize_text(category) for category in reference_categories if normalize_text(category)}
++    candidates = {normalize_text(category) for category in candidate_categories if normalize_text(category)}
+     if not reference or not candidates:
+         return 0.0
+ 
+-    unmatched = list(candidates)
++    reference_specific = reference - _GENERIC_CATEGORY_TERMS
++    candidate_specific = candidates - _GENERIC_CATEGORY_TERMS
++    if not reference_specific and not candidate_specific:
++        return 0.18 if reference & candidates else 0.0
++    if not reference_specific or not candidate_specific:
++        return 0.0
++    reference = reference_specific
++    candidates = candidate_specific
++
+     matches = 0
++    unmatched = set(candidates)
+     for reference_category in reference:
+-        match_index = next(
++        match = next(
+             (
+-                index
+-                for index, candidate_category in enumerate(unmatched)
+-                if categories_match(reference_category, [candidate_category])
+-                or categories_match(candidate_category, [reference_category])
++                candidate
++                for candidate in unmatched
++                if categories_match(reference_category, [candidate])
++                or categories_match(candidate, [reference_category])
+             ),
+             None,
+         )
+-        if match_index is None:
+-            continue
+-        matches += 1
+-        unmatched.pop(match_index)
++        if match is not None:
++            matches += 1
++            unmatched.remove(match)
+ 
+     union_size = len(reference) + len(candidates) - matches
+     return matches / union_size if union_size else 0.0
+ 
+ 
+-def category_specificity_score(categories: set[str]) -> float:
+-    if not categories:
++def category_overlap_score(reference_categories: list[str], candidate_categories: list[str]) -> float:
++    taxonomy_score = taxonomy_similarity(reference_categories, candidate_categories)
++    reference_profile = taxonomy_profile(reference_categories)
++    candidate_profile = taxonomy_profile(candidate_categories)
++    if reference_profile.all_ids and candidate_profile.all_ids:
++        return taxonomy_score
++    return _raw_category_similarity(reference_categories, candidate_categories)
++
++
++def _theme_similarity(reference_profile, candidate_profile) -> float:
++    if not reference_profile.themes or not candidate_profile.themes:
+         return 0.0
+-    specific = [category for category in categories if category not in _GENERIC_CATEGORY_TERMS]
+-    return len(specific) / len(categories)
+-
+-
+-def _profile_signal_strength(profile) -> float:
+-    components = [
+-        profile.themes,
+-        profile.tones,
+-        profile.narrative_markers,
+-        profile.category_kinds,
+-        profile.audiences,
+-        profile.pace_markers,
+-        profile.keywords,
+-    ]
+-    total_labels = sum(len(component) for component in components)
+-    return min(total_labels / 14, 1.0)
++    intersection = len(reference_profile.themes & candidate_profile.themes)
++    if not intersection:
++        return 0.0
++    jaccard = intersection / len(reference_profile.themes | candidate_profile.themes)
++    dice = (2 * intersection) / (len(reference_profile.themes) + len(candidate_profile.themes))
++    return jaccard * 0.62 + dice * 0.38
+ 
+ 
+-def _dynamic_profile_weight(
+-    reference_category_specificity: float,
+-    candidate_category_specificity: float,
+-    description_overlap: float,
+-    reference_profile_strength: float,
+-    candidate_profile_strength: float,
+-) -> float:
+-    weight = _WEIGHT_THEME
+-    average_specificity = (reference_category_specificity + candidate_category_specificity) / 2
+-    average_profile_strength = (reference_profile_strength + candidate_profile_strength) / 2
++def _style_similarity(reference_profile, candidate_profile) -> tuple[float, bool]:
++    component_scores = profile_component_scores(reference_profile, candidate_profile)
++    weighted_sum = 0.0
++    available_weight = 0.0
+ 
+-    if average_specificity < 0.35:
+-        weight += 0.03
+-    if average_profile_strength >= 0.45:
+-        weight += 0.03
+-    if description_overlap >= 0.20:
+-        weight += 0.02
++    for component, weight in _STYLE_COMPONENT_WEIGHTS.items():
++        reference_values = getattr(reference_profile, component)
++        candidate_values = getattr(candidate_profile, component)
++        if not reference_values or not candidate_values:
++            continue
++        weighted_sum += component_scores[component] * weight
++        available_weight += weight
+ 
+-    return min(weight, 0.26)
++    if not available_weight:
++        return 0.0, False
++    return weighted_sum / available_weight, True
+ 
+ 
+-def _compute_profile_score(reference_profile, candidate_profile) -> float:
+-    component_scores = profile_component_scores(reference_profile, candidate_profile)
+-    return sum(
+-        component_scores[name] * weight
+-        for name, weight in _PROFILE_COMPONENT_WEIGHTS.items()
++def _author_similarity(reference: BookResponse, book: BookResponse) -> float:
++    reference_authors = {
++        normalize_person_name(author)
++        for author in reference.authors
++        if normalize_person_name(author)
++    }
++    candidate_authors = {
++        normalize_person_name(author)
++        for author in book.authors
++        if normalize_person_name(author)
++    }
++    if not reference_authors or not candidate_authors:
++        return 0.0
++    if reference_authors & candidate_authors:
++        return 1.0
++
++    best = 0.0
++    for reference_author in reference_authors:
++        reference_tokens = set(reference_author.split())
++        for candidate_author in candidate_authors:
++            candidate_tokens = set(candidate_author.split())
++            if not reference_tokens or not candidate_tokens:
++                continue
++            overlap = len(reference_tokens & candidate_tokens) / max(len(reference_tokens), len(candidate_tokens))
++            best = max(best, overlap)
++    return best if best >= 0.75 else 0.0
++
++
++def _linear_proximity(reference_value: int, candidate_value: int, tolerance: int) -> float:
++    return max(0.0, 1.0 - abs(reference_value - candidate_value) / tolerance)
++
++
++def score_book_components(book: BookResponse, reference: BookResponse) -> dict[str, Optional[float]]:
++    reference_profile = extract_book_profile(reference)
++    candidate_profile = extract_book_profile(book)
++    reference_taxonomy = taxonomy_profile(reference.categories)
++    candidate_taxonomy = taxonomy_profile(book.categories)
++
++    taxonomy_available = bool(
++        (reference_taxonomy.all_ids and candidate_taxonomy.all_ids)
++        or (reference.categories and book.categories)
+     )
++    themes_available = bool(reference_profile.themes and candidate_profile.themes)
++    style_score, style_available = _style_similarity(reference_profile, candidate_profile)
++    text_available = bool(_book_keyword_counter(reference) and _book_keyword_counter(book))
++    author_available = bool(reference.authors and book.authors)
++    year_available = reference.published_year is not None and book.published_year is not None
++    pages_available = reference.page_count is not None and book.page_count is not None
++    title_available = bool(reference.title and book.title)
++    reference_language = normalize_language_code(reference.language)
++    candidate_language = normalize_language_code(book.language)
++    language_available = bool(reference_language and candidate_language)
++
++    return {
++        "taxonomy": category_overlap_score(reference.categories, book.categories) if taxonomy_available else None,
++        "themes": _theme_similarity(reference_profile, candidate_profile) if themes_available else None,
++        "style": style_score if style_available else None,
++        "text": keyword_overlap_score(reference, book) if text_available else None,
++        "author": _author_similarity(reference, book) if author_available else None,
++        "year": (
++            _linear_proximity(reference.published_year, book.published_year, 60)
++            if year_available
++            else None
++        ),
++        "pages": (
++            _linear_proximity(reference.page_count, book.page_count, 600)
++            if pages_available
++            else None
++        ),
++        "title": token_similarity(reference.title, book.title) if title_available else None,
++        "language": (1.0 if reference_language == candidate_language else 0.0) if language_available else None,
++    }
+ 
+ 
+-def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
+-    """
+-    Aplica filtros explícitos.
++def _calibrate_score(components: dict[str, Optional[float]]) -> float:
++    weighted_sum = 0.0
++    available_weight = 0.0
++    semantic_sum = 0.0
++
++    for name, weight in _SCORE_WEIGHTS.items():
++        value = components.get(name)
++        if value is None:
++            continue
++        bounded_value = min(1.0, max(0.0, value))
++        contribution = bounded_value * weight
++        weighted_sum += contribution
++        available_weight += weight
++        if name in {"taxonomy", "themes", "style", "text"}:
++            semantic_sum += contribution
++
++    if not available_weight or not weighted_sum:
++        return 0.0
++
++    raw_score = weighted_sum / max(_MIN_EVIDENCE_WEIGHT, available_weight)
++    calibrated = min(1.0, max(0.0, raw_score)) ** _CALIBRATION_EXPONENT
+ 
+-    Quando há filtro de páginas/ano, metadados ausentes são excluídos por padrão.
+-    Defina include_unknown_metadata=True para manter esses candidatos.
+-    """
++    # Sem qualquer relação temática/textual, contexto editorial não deve produzir
++    # uma recomendação forte por coincidência de idioma, páginas ou período.
++    if semantic_sum < 0.025:
++        calibrated = min(calibrated, 0.32)
++
++    return round(calibrated, 4)
++
++
++def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
+     result: list[BookResponse] = []
+     reference_authors = {
+         normalize_person_name(author)
+@@ -188,10 +308,7 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
+             if not reference_authors or candidate_authors & reference_authors:
+                 continue
+ 
+-        if filters.get("category") and not categories_match(
+-            filters["category"],
+-            book.categories,
+-        ):
++        if filters.get("category") and not categories_match(filters["category"], book.categories):
+             continue
+ 
+         if filters.get("language"):
+@@ -237,73 +354,31 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
+ 
+ 
+ def score_books(books: list[BookResponse], reference: BookResponse) -> list[ScoredBook]:
+-    """Pontua candidatos em uma escala normalizada de 0.0 a 1.0."""
+-    ref_cats = {normalize_text(category) for category in reference.categories if category}
+-    ref_authors = {
+-        normalize_person_name(author)
+-        for author in reference.authors
+-        if author
+-    }
+-    ref_language = normalize_language_code(reference.language)
+-    reference_profile = extract_book_profile(reference)
+-    reference_category_specificity = category_specificity_score(ref_cats)
+-    reference_profile_strength = _profile_signal_strength(reference_profile)
+-
++    """Pontua compatibilidade em 0.0-1.0, normalizando metadados ausentes."""
+     scored: list[ScoredBook] = []
+-    for book in books:
+-        score = 0.0
+-
+-        book_cats = {normalize_text(category) for category in book.categories if category}
+-        if ref_cats and book_cats:
+-            overlap = category_overlap_score(reference.categories, book.categories)
+-            score += overlap * _WEIGHT_CATEGORY
++    total_weight = sum(_SCORE_WEIGHTS.values())
+ 
+-        book_authors = {
+-            normalize_person_name(author)
+-            for author in book.authors
+-            if author
++    for book in books:
++        components = score_book_components(book, reference)
++        score = _calibrate_score(components)
++        available_weight = sum(
++            _SCORE_WEIGHTS[name]
++            for name, value in components.items()
++            if value is not None
++        )
++        serialized_components = {
++            name: round(min(1.0, max(0.0, value)), 4)
++            for name, value in components.items()
++            if value is not None
+         }
+-        if ref_authors & book_authors:
+-            score += _WEIGHT_AUTHOR
+-
+-        if reference.page_count is not None and book.page_count is not None:
+-            difference = abs(reference.page_count - book.page_count)
+-            score += max(0.0, 1.0 - difference / 500) * _WEIGHT_PAGES
+-        elif book.page_count is None:
+-            score -= _PENALTY_NO_PAGES
+-
+-        if reference.published_year is not None and book.published_year is not None:
+-            difference = abs(reference.published_year - book.published_year)
+-            score += max(0.0, 1.0 - difference / 30) * _WEIGHT_YEAR
+-        elif book.published_year is None:
+-            score -= _PENALTY_NO_YEAR
+-
+-        if ref_language and normalize_language_code(book.language) == ref_language:
+-            score += _WEIGHT_LANGUAGE
+-
+-        score += token_similarity(reference.title, book.title) * _WEIGHT_TITLE
+-
+-        description_overlap = keyword_overlap_score(reference, book)
+-        score += description_overlap * _WEIGHT_DESCRIPTION
+-
+-        specificity = category_specificity_score(book_cats)
+-        score += specificity * _WEIGHT_SPECIFICITY
+-        if book_cats and specificity == 0.0:
+-            score -= _PENALTY_GENERIC_ONLY
+-
+-        candidate_profile = extract_book_profile(book)
+-        candidate_profile_strength = _profile_signal_strength(candidate_profile)
+-        profile_weight = _dynamic_profile_weight(
+-            reference_category_specificity=reference_category_specificity,
+-            candidate_category_specificity=specificity,
+-            description_overlap=description_overlap,
+-            reference_profile_strength=reference_profile_strength,
+-            candidate_profile_strength=candidate_profile_strength,
++        scored.append(
++            ScoredBook(
++                **book.model_dump(),
++                score=score,
++                score_components=serialized_components,
++                score_coverage=round(available_weight / total_weight, 4),
++            )
+         )
+-        score += _compute_profile_score(reference_profile, candidate_profile) * profile_weight
+-
+-        normalized_score = round(min(1.0, max(0.0, score)), 4)
+-        scored.append(ScoredBook(**book.model_dump(), score=normalized_score))
+ 
+     scored.sort(key=lambda candidate: candidate.score, reverse=True)
+     return scored
+diff --git a/main.py b/main.py
+index 0f3e4c5..5dba501 100644
+--- a/main.py
++++ b/main.py
+@@ -5,6 +5,8 @@ import re
+ import time
+ from collections import OrderedDict
+ from contextlib import asynccontextmanager
++from difflib import SequenceMatcher
++from itertools import zip_longest
+ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ from typing import AsyncIterator, Optional
+ 
+@@ -26,6 +28,7 @@ from metadata_normalizer import (
+     normalize_text,
+ )
+ from models import AuthorResponse, BookResponse, RecommendationResponse
++from taxonomy import taxonomy_search_terms
+ 
+ _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+ 
+@@ -37,7 +40,7 @@ async def _get_http_client() -> httpx.AsyncClient:
+             timeout=httpx.Timeout(10.0),
+             follow_redirects=True,
+             verify=HTTP_SSL_VERIFY,
+-            headers={"User-Agent": "Book-it/0.2 (book discovery application)"},
++            headers={"User-Agent": "Book-it/0.3 (book discovery application)"},
+         )
+     return _HTTP_CLIENT
+ 
+@@ -57,7 +60,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+ app = FastAPI(
+     title="Book-it API",
+     description="Busca de livros, autores e recomendações via Google Books e Open Library",
+-    version="0.2.0",
++    version="0.3.0",
+     lifespan=lifespan,
+ )
+ 
+@@ -79,8 +82,8 @@ API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
+ CACHE_TTL_SECONDS = int(os.getenv("BOOKIT_CACHE_TTL_SECONDS", "21600"))
+ CACHE_MAX_ITEMS = int(os.getenv("BOOKIT_CACHE_MAX_ITEMS", "512"))
+ GOOGLE_COOLDOWN_SECONDS = int(os.getenv("BOOKIT_GOOGLE_COOLDOWN_SECONDS", "900"))
+-MIN_RECOMMENDATION_SCORE = float(os.getenv("BOOKIT_MIN_RECOMMENDATION_SCORE", "0.18"))
+-MAX_SEARCH_TERMS = int(os.getenv("BOOKIT_MAX_SEARCH_TERMS", "4"))
++MIN_RECOMMENDATION_SCORE = float(os.getenv("BOOKIT_MIN_RECOMMENDATION_SCORE", "0.34"))
++MAX_SEARCH_TERMS = int(os.getenv("BOOKIT_MAX_SEARCH_TERMS", "6"))
+ COVER_FETCH_TIMEOUT_SECONDS = float(os.getenv("BOOKIT_COVER_FETCH_TIMEOUT_SECONDS", "8"))
+ MAX_CONCURRENT_COVER_TASKS = int(os.getenv("BOOKIT_MAX_CONCURRENT_COVER_TASKS", "4"))
+ MAX_CONCURRENT_PROVIDER_CALLS = int(os.getenv("BOOKIT_MAX_CONCURRENT_PROVIDER_CALLS", "6"))
+@@ -95,6 +98,19 @@ GENERIC_SUBJECTS = {
+     "books",
+ }
+ 
++_SEARCH_NOISE_TERMS = {
++    "analysis",
++    "companion",
++    "journal",
++    "notebook",
++    "quiz",
++    "summary",
++    "study guide",
++    "teacher guide",
++    "unofficial",
++    "workbook",
++}
++
+ 
+ class GoogleBooksUnavailable(Exception):
+     pass
+@@ -340,7 +356,7 @@ async def fetch_open_library_search(params: dict) -> list[dict]:
+     if cached is not None:
+         return cached
+ 
+-    headers = {"User-Agent": "BookRecomendations/0.1 (Open Library search)"}
++    headers = {"User-Agent": "Book-it/0.3 (Open Library search)"}
+     try:
+         async with _PROVIDER_SEMAPHORE:
+             async with _build_async_client(timeout=10.0, headers=headers) as client:
+@@ -369,7 +385,7 @@ async def fetch_open_library_authors(
+     if cached is not None:
+         return [AuthorResponse.model_validate(author) for author in cached]
+ 
+-    headers = {"User-Agent": "Book-it/0.2 (author search)"}
++    headers = {"User-Agent": "Book-it/0.3 (author search)"}
+     try:
+         async with _PROVIDER_SEMAPHORE:
+             async with _build_async_client(timeout=10.0, headers=headers) as client:
+@@ -495,7 +511,7 @@ async def fetch_open_library_author_works(
+     if cached is not None:
+         return [BookResponse.model_validate(book) for book in cached]
+ 
+-    headers = {"User-Agent": "Book-it/0.2 (author works)"}
++    headers = {"User-Agent": "Book-it/0.3 (author works)"}
+     try:
+         async with _PROVIDER_SEMAPHORE:
+             async with _build_async_client(timeout=10.0, headers=headers) as client:
+@@ -576,7 +592,12 @@ async def fetch_google_cover_candidates(title: str, authors: list[str]) -> list[
+             volume_info = item.get("volumeInfo", {})
+             item_title = normalize_text(volume_info.get("title"))
+             normalized_title = normalize_text(cleaned_title)
+-            if normalized_title and item_title and normalized_title not in item_title and item_title not in normalized_title:
++            if (
++                normalized_title
++                and item_title
++                and normalized_title not in item_title
++                and item_title not in normalized_title
++            ):
+                 continue
+ 
+             item_authors = {normalize_text(author) for author in volume_info.get("authors", []) if author}
+@@ -794,6 +815,46 @@ async def fetch_open_library_books_by_query(
+     return [book for book in books if book is not None]
+ 
+ 
++async def fetch_open_library_books_by_title(
++    title: str,
++    author: Optional[str] = None,
++    max_results: int = 20,
++    offset: int = 0,
++) -> list[BookResponse]:
++    params = {
++        "title": title.strip(),
++        "limit": max_results,
++        "offset": offset,
++        "fields": OPEN_LIBRARY_BOOK_FIELDS,
++    }
++    if has_text(author):
++        params["author"] = author.strip()
++
++    docs = await fetch_open_library_search(params)
++    books = [parse_open_library_doc(doc) for doc in docs]
++    return [book for book in books if book is not None]
++
++
++async def fetch_open_library_books_by_isbn(
++    isbn: str,
++    max_results: int = 20,
++    offset: int = 0,
++) -> list[BookResponse]:
++    normalized_isbn = normalize_isbn(isbn)
++    if not normalized_isbn:
++        return []
++
++    params = {
++        "isbn": normalized_isbn,
++        "limit": max_results,
++        "offset": offset,
++        "fields": OPEN_LIBRARY_BOOK_FIELDS,
++    }
++    docs = await fetch_open_library_search(params)
++    books = [parse_open_library_doc(doc) for doc in docs]
++    return [book for book in books if book is not None]
++
++
+ async def fetch_open_library_book_by_id(book_id: str) -> Optional[BookResponse]:
+     normalized_key = _open_library_key(book_id)
+     search_olid = normalized_key.rsplit("/", 1)[-1]
+@@ -826,7 +887,7 @@ async def fetch_open_library_books_by_subject(
+     if has_text(author):
+         params["author"] = author.strip()
+     if has_text(language):
+-        params["language"] = language.strip()
++        params["lang"] = normalize_language_code(language)
+ 
+     docs = await fetch_open_library_search(params)
+     books = [parse_open_library_doc(doc) for doc in docs]
+@@ -846,7 +907,7 @@ async def fetch_open_library_subjects(
+     if authors:
+         params["author"] = authors[0]
+ 
+-    headers = {"User-Agent": "BookRecomendations/0.1 (Open Library enrichment)"}
++    headers = {"User-Agent": "Book-it/0.3 (Open Library enrichment)"}
+ 
+     try:
+         docs = await fetch_open_library_search(params)
+@@ -965,15 +1026,26 @@ def build_search_terms(
+ ) -> list[str]:
+     ordered_terms: list[str] = []
+ 
+-    if category and category.strip():
++    if has_text(category):
++        ordered_terms.extend(
++            taxonomy_search_terms([category.strip()], include_related=False, limit=3)
++        )
+         ordered_terms.append(category.strip())
+ 
+-    ordered_terms.extend(subject for subject in enriched_subjects if subject.strip())
++    combined_categories = [*reference.categories, *enriched_subjects]
++    ordered_terms.extend(
++        taxonomy_search_terms(
++            combined_categories,
++            include_related=True,
++            limit=MAX_SEARCH_TERMS,
++        )
++    )
++    ordered_terms.extend(select_specific_subjects(enriched_subjects, limit=4))
+     ordered_terms.extend(select_specific_subjects(reference.categories, limit=4))
+ 
+     profile = extract_book_profile(reference)
+     ordered_terms.extend(theme.replace("_", " ") for theme in sorted(profile.themes))
+-    ordered_terms.extend(sorted(profile.keywords)[:4])
++    ordered_terms.extend(sorted(profile.keywords)[:5])
+ 
+     deduped_terms: list[str] = []
+     seen: set[str] = set()
+@@ -994,117 +1066,113 @@ def build_search_terms(
+     return deduped_terms
+ 
+ 
++def interleave_book_batches(batches: list[list[BookResponse]]) -> list[BookResponse]:
++    """Distribui resultados entre consultas para evitar domínio do primeiro termo."""
++    interleaved: list[BookResponse] = []
++    for row in zip_longest(*batches):
++        interleaved.extend(book for book in row if book is not None)
++    return interleaved
++
++
+ async def fetch_candidate_books(
+     search_terms: list[str],
+     reference: Optional[BookResponse] = None,
+     max_results: int = 40,
++    language: Optional[str] = None,
+ ) -> list[BookResponse]:
+-    candidates: list[BookResponse] = []
+-    seen_ids: set[str] = set()
+-    seen_signatures: set[str] = set()
+-    per_term_limit = max(6, max_results // max(1, len(search_terms)))
+-    reference_author = reference.authors[0] if reference and reference.authors else None
+-
+-    for term in search_terms:
+-        queries = []
+-        if has_text(reference_author):
+-            queries.append(f'subject:"{term.strip()}" inauthor:"{reference_author.strip()}"')
+-        queries.append(f'subject:"{term.strip()}"')
+-
+-        items_batches = await asyncio.gather(
+-            *[fetch_google_books(query, max_results=per_term_limit) for query in queries]
++    if not search_terms:
++        return []
++
++    per_query_limit = max(6, min(20, max_results // max(1, len(search_terms))))
++    queries: list[str] = []
++    for index, term in enumerate(search_terms):
++        cleaned = term.strip()
++        if not cleaned:
++            continue
++        queries.append(f'subject:"{cleaned}"')
++        if index < 2:
++            queries.append(f'"{cleaned}"')
++    queries = dedupe_preserve_order(queries)
++
++    batches = await asyncio.gather(
++        *(
++            fetch_google_books(
++                query,
++                max_results=per_query_limit,
++                language=language,
++            )
++            for query in queries
++        ),
++        return_exceptions=True,
++    )
++
++    parsed_batches: list[list[BookResponse]] = []
++    unavailable_count = 0
++    for batch in batches:
++        if isinstance(batch, GoogleBooksUnavailable):
++            unavailable_count += 1
++            continue
++        if isinstance(batch, Exception):
++            continue
++        parsed_batches.append(
++            [book for item in batch if (book := parse_book(item)) is not None]
+         )
+-        for items in items_batches:
+-            parsed_books = [parse_book(item) for item in items]
+-            for book in parsed_books:
+-                if not book or book.id in seen_ids:
+-                    continue
+-                signature = normalize_book_signature(book)
+-                if signature in seen_signatures:
+-                    continue
+-                seen_ids.add(book.id)
+-                seen_signatures.add(signature)
+-                candidates.append(book)
+-                if len(candidates) >= max_results:
+-                    return candidates
+-
+-    # fallback: se candidatos insuficientes e temos autor de referência,
+-    # busca por inauthor - garante resultados mesmo sem categories/subjects
+-    if len(candidates) < 5 and reference and reference.authors:
+-        author = reference.authors[0]
+-        items = await fetch_google_books(f'inauthor:"{author}"', max_results=20)
+-        for item in items:
+-            book = parse_book(item)
+-            if not book or book.id in seen_ids:
+-                continue
+-            signature = normalize_book_signature(book)
+-            if signature in seen_signatures:
+-                continue
+-            seen_ids.add(book.id)
+-            seen_signatures.add(signature)
+-            candidates.append(book)
+ 
+-    return candidates
++    if batches and unavailable_count == len(batches):
++        raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
++
++    candidates = dedupe_books(interleave_book_batches(parsed_batches))
++    if len(candidates) < 10 and reference and reference.authors:
++        try:
++            author_items = await fetch_google_books(
++                f'inauthor:"{reference.authors[0]}"',
++                max_results=min(20, max_results),
++                language=language,
++            )
++        except GoogleBooksUnavailable:
++            author_items = []
++        candidates.extend(
++            book for item in author_items if (book := parse_book(item)) is not None
++        )
++        candidates = dedupe_books(candidates)
++
++    return candidates[:max_results]
+ 
+ 
+ async def fetch_open_library_candidates(
+     search_terms: list[str],
+     reference: Optional[BookResponse] = None,
+     max_results: int = 40,
++    language: Optional[str] = None,
+ ) -> list[BookResponse]:
+-    candidates: list[BookResponse] = []
+-    seen_ids: set[str] = set()
+-    seen_signatures: set[str] = set()
+-    per_term_limit = max(6, max_results // max(1, len(search_terms)))
+-    reference_author = reference.authors[0] if reference and reference.authors else None
+-    reference_language = reference.language if reference else None
++    if not search_terms:
++        return []
+ 
+-    for term in search_terms:
+-        batches = await asyncio.gather(
+-            fetch_open_library_books_by_subject(
+-                term.strip(),
+-                author=reference_author,
+-                language=reference_language,
+-                max_results=per_term_limit,
+-            ),
++    per_term_limit = max(6, min(20, max_results // max(1, len(search_terms))))
++    batches = await asyncio.gather(
++        *(
+             fetch_open_library_books_by_subject(
+                 term.strip(),
+-                language=reference_language,
++                language=language,
+                 max_results=per_term_limit,
+-            ),
+-        )
++            )
++            for term in search_terms
++            if term.strip()
++        ),
++        return_exceptions=True,
++    )
+ 
+-        for books in batches:
+-            for book in books:
+-                if not book or book.id in seen_ids:
+-                    continue
+-                signature = normalize_book_signature(book)
+-                if signature in seen_signatures:
+-                    continue
+-                seen_ids.add(book.id)
+-                seen_signatures.add(signature)
+-                candidates.append(book)
+-                if len(candidates) >= max_results:
+-                    return candidates
++    valid_batches = [batch for batch in batches if isinstance(batch, list)]
++    candidates = dedupe_books(interleave_book_batches(valid_batches))
+ 
+-    if len(candidates) < 5 and reference and reference.authors:
++    if len(candidates) < 10 and reference and reference.authors:
+         fallback_books = await fetch_open_library_books_by_author(
+             reference.authors[0],
+             max_results=min(20, max_results),
+         )
+-        for book in fallback_books:
+-            if not book or book.id in seen_ids:
+-                continue
+-            signature = normalize_book_signature(book)
+-            if signature in seen_signatures:
+-                continue
+-            seen_ids.add(book.id)
+-            seen_signatures.add(signature)
+-            candidates.append(book)
+-            if len(candidates) >= max_results:
+-                return candidates
++        candidates = dedupe_books([*candidates, *fallback_books])
+ 
+-    return candidates
++    return candidates[:max_results]
+ 
+ 
+ def _book_identity_keys(book: BookResponse) -> list[str]:
+@@ -1124,116 +1192,279 @@ def _book_identity_keys(book: BookResponse) -> list[str]:
+     return keys
+ 
+ 
++def _merge_unique_strings(primary: list[str], secondary: list[str]) -> list[str]:
++    merged: list[str] = []
++    seen: set[str] = set()
++    for value in [*primary, *secondary]:
++        normalized = normalize_text(value)
++        if not normalized or normalized in seen:
++            continue
++        seen.add(normalized)
++        merged.append(value)
++    return merged
++
++
++def merge_book_metadata(primary: BookResponse, secondary: BookResponse) -> BookResponse:
++    """Une metadados complementares sem trocar a identidade do resultado ranqueado."""
++    merged = primary.model_copy(deep=True)
++    merged.authors = _merge_unique_strings(primary.authors, secondary.authors)
++    merged.categories = _merge_unique_strings(primary.categories, secondary.categories)
++    merged.isbn_10 = _merge_unique_strings(primary.isbn_10, secondary.isbn_10)
++    merged.isbn_13 = _merge_unique_strings(primary.isbn_13, secondary.isbn_13)
++
++    if not merged.work_id:
++        merged.work_id = secondary.work_id
++    if not merged.edition_id:
++        merged.edition_id = secondary.edition_id
++    if merged.page_count is None:
++        merged.page_count = secondary.page_count
++    if merged.published_year is None:
++        merged.published_year = secondary.published_year
++    if not has_text(merged.language):
++        merged.language = secondary.language
++    if not merged.thumbnail:
++        merged.thumbnail = secondary.thumbnail
++    if len(secondary.description or "") > len(merged.description or ""):
++        merged.description = secondary.description
++
++    return merged
++
++
+ def dedupe_books(books: list[BookResponse]) -> list[BookResponse]:
+     deduped: list[BookResponse] = []
+-    seen_keys: set[str] = set()
++    key_to_index: dict[str, int] = {}
+ 
+     for book in books:
+-        identity_keys = _book_identity_keys(book)
+-        if any(key in seen_keys for key in identity_keys):
+-            continue
+-        seen_keys.update(identity_keys)
+-        deduped.append(book)
++        identity_keys = set(_book_identity_keys(book))
++        duplicate_index = next(
++            (key_to_index[key] for key in identity_keys if key in key_to_index),
++            None,
++        )
++        if duplicate_index is None:
++            duplicate_index = len(deduped)
++            deduped.append(book.model_copy(deep=True))
++        else:
++            deduped[duplicate_index] = merge_book_metadata(deduped[duplicate_index], book)
++
++        for key in _book_identity_keys(deduped[duplicate_index]):
++            key_to_index[key] = duplicate_index
++        for key in identity_keys:
++            key_to_index[key] = duplicate_index
+ 
+     return deduped
+ 
++
+ def _author_match_score(authors: list[str], author_query: Optional[str]) -> float:
+     if not has_text(author_query):
+         return 0.0
+ 
+     normalized_query = normalize_person_name(author_query)
+-    normalized_authors = {normalize_person_name(author) for author in authors if author}
+-    if normalized_query in normalized_authors:
+-        return 1.0
+-    if any(normalized_query in author or author in normalized_query for author in normalized_authors):
+-        return 0.6
+-    return 0.0
++    query_tokens = set(normalized_query.split())
++    best = 0.0
++    for author in authors or []:
++        normalized_author = normalize_person_name(author)
++        if not normalized_author:
++            continue
++        if normalized_author == normalized_query:
++            return 1.0
++        if normalized_query in normalized_author or normalized_author in normalized_query:
++            best = max(best, 0.82)
++            continue
++        author_tokens = set(normalized_author.split())
++        if query_tokens and author_tokens:
++            overlap = len(query_tokens & author_tokens) / max(len(query_tokens), len(author_tokens))
++            if overlap >= 0.75:
++                best = max(best, overlap)
++    return best
++
++
++def _query_isbn(value: str) -> str:
++    normalized = normalize_isbn(value)
++    compact_input = re.sub(r"[^0-9Xx]", "", value or "")
++    return normalized if normalized and len(compact_input) in {10, 13} else ""
++
++
++def build_book_search_queries(title_query: str, author_query: Optional[str] = None) -> list[str]:
++    title = re.sub(r'\s+', ' ', (title_query or '').replace('"', ' ')).strip()
++    author = re.sub(r'\s+', ' ', (author_query or '').replace('"', ' ')).strip()
++    isbn = _query_isbn(title)
++    if isbn:
++        return [f'isbn:{isbn}']
++
++    queries: list[str] = []
++    if author:
++        queries.append(f'intitle:"{title}" inauthor:"{author}"')
++    queries.append(f'intitle:"{title}"')
++    if author:
++        queries.append(f'"{title}" inauthor:"{author}"')
++    queries.append(f'"{title}"')
++    queries.append(title)
++    return dedupe_preserve_order(queries)
++
++
++def _search_noise_penalty(title: str, query: str) -> float:
++    normalized_title = normalize_text(title)
++    normalized_query = normalize_text(query)
++    penalty = 0.0
++    for term in _SEARCH_NOISE_TERMS:
++        normalized_term = normalize_text(term)
++        if normalized_term in normalized_title and normalized_term not in normalized_query:
++            penalty += 0.18 if " " in normalized_term else 0.12
++    return min(penalty, 0.42)
++
++
++def _book_search_score(
++    book: BookResponse,
++    title_query: str,
++    author_query: Optional[str] = None,
++) -> float:
++    query_isbn = _query_isbn(title_query)
++    if query_isbn:
++        return 2.0 if query_isbn in {*book.isbn_10, *book.isbn_13} else 0.0
++
++    title_score = _title_similarity(book.title, title_query)
++    author_score = _author_match_score(book.authors, author_query)
++    metadata_quality = sum(
++        (
++            bool(book.thumbnail),
++            bool(book.description),
++            bool(book.categories),
++            book.published_year is not None,
++            bool(book.isbn_10 or book.isbn_13),
++        )
++    ) / 5
++
++    if has_text(author_query):
++        score = title_score * 0.70 + author_score * 0.25 + metadata_quality * 0.05
++    else:
++        score = title_score * 0.92 + metadata_quality * 0.08
++
++    if canonicalize_title(book.title) == canonicalize_title(title_query):
++        score += 0.12
++    if has_text(author_query) and author_score == 1.0:
++        score += 0.06
++
++    score -= _search_noise_penalty(book.title, title_query)
++    return max(0.0, score)
++
+ 
+ def _search_result_score(item: dict, title_query: str, author_query: Optional[str] = None) -> float:
+-    info = item.get("volumeInfo", {})
+-    score = _reference_score(item, title_query)
++    book = parse_book(item)
++    return _book_search_score(book, title_query, author_query) if book else 0.0
+ 
+-    authors = info.get("authors", []) or []
+-    score += _author_match_score(authors, author_query) * 4.0
+ 
+-    categories = [normalize_text(category) for category in info.get("categories", []) or []]
+-    if any(category not in GENERIC_SUBJECTS for category in categories):
+-        score += 1.0
++def _open_library_search_score(
++    book: BookResponse,
++    title_query: str,
++    author_query: Optional[str] = None,
++) -> float:
++    return _book_search_score(book, title_query, author_query)
+ 
+-    return score
+ 
+-def _open_library_search_score(book: BookResponse, title_query: str, author_query: Optional[str] = None) -> float:
+-    score = _title_similarity(book.title, title_query) * 8.0
+-    score += _author_match_score(book.authors, author_query) * 4.0
+-    if book.thumbnail:
+-        score += 1.0
+-    if book.categories and any(normalize_text(category) not in GENERIC_SUBJECTS for category in book.categories):
+-        score += 1.0
+-    if book.published_year:
+-        score += 0.5
+-    return score
++async def _search_google_book_candidates(
++    title_query: str,
++    author_query: Optional[str],
++    max_results: int,
++    offset: int,
++) -> list[BookResponse]:
++    queries = build_book_search_queries(title_query, author_query)
++    per_query_limit = max(6, min(20, max_results * 2))
++    batches = await asyncio.gather(
++        *(
++            fetch_google_books(
++                query,
++                max_results=per_query_limit,
++                start_index=offset,
++            )
++            for query in queries
++        ),
++        return_exceptions=True,
++    )
++
++    books: list[BookResponse] = []
++    unavailable_count = 0
++    for batch in batches:
++        if isinstance(batch, GoogleBooksUnavailable):
++            unavailable_count += 1
++            continue
++        if isinstance(batch, Exception):
++            continue
++        books.extend(book for item in batch if (book := parse_book(item)) is not None)
++
++    if batches and unavailable_count == len(batches):
++        raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
++    return books
++
++
++async def _search_open_library_book_candidates(
++    title_query: str,
++    author_query: Optional[str],
++    max_results: int,
++    offset: int,
++) -> list[BookResponse]:
++    isbn = _query_isbn(title_query)
++    if isbn:
++        return await fetch_open_library_books_by_isbn(
++            isbn,
++            max_results=max_results,
++            offset=offset,
++        )
++
++    query = f"{title_query.strip()} {author_query.strip()}" if has_text(author_query) else title_query.strip()
++    batches = await asyncio.gather(
++        fetch_open_library_books_by_title(
++            title_query,
++            author=author_query,
++            max_results=max_results * 2,
++            offset=offset,
++        ),
++        fetch_open_library_books_by_query(
++            query,
++            max_results=max_results * 2,
++            offset=offset,
++        ),
++        return_exceptions=True,
++    )
++    books: list[BookResponse] = []
++    for batch in batches:
++        if isinstance(batch, Exception):
++            continue
++        books.extend(batch)
++    return books
+ 
+ @app.get("/")
+ async def root():
+-    return {"service": "Book-it API", "version": "0.2.0"}
++    return {"service": "Book-it API", "version": "0.3.0"}
+ 
+ 
+ @app.get("/search", response_model=list[BookResponse])
+ async def search_books(
+-    q: str = Query(..., description="Título ou termo de busca"),
++    q: str = Query(..., description="Título, termo ou ISBN"),
+     author: Optional[str] = Query(None, description="Autor opcional para desambiguar o título"),
+     max_results: int = Query(10, ge=1, le=40),
+     offset: int = Query(0, ge=0, le=1000),
+ ):
+     if not has_text(q):
+-        raise HTTPException(status_code=422, detail="Informe um título para buscar livros")
++        raise HTTPException(status_code=422, detail="Informe um título ou ISBN")
+ 
+-    try:
+-        queries = [f'intitle:"{q.strip()}"']
+-        if has_text(author):
+-            queries.insert(0, f'intitle:"{q.strip()}" inauthor:"{author.strip()}"')
+-            queries.append(f'{q.strip()} inauthor:"{author.strip()}"')
+-        queries.append(q.strip())
+-        queries = dedupe_preserve_order(queries)
++    google_result, open_library_result = await asyncio.gather(
++        _search_google_book_candidates(q.strip(), author, max_results, offset),
++        _search_open_library_book_candidates(q.strip(), author, max_results, offset),
++        return_exceptions=True,
++    )
+ 
+-        batches = await asyncio.gather(
+-            *[
+-                fetch_google_books(
+-                    query,
+-                    max_results=max_results,
+-                    start_index=offset,
+-                )
+-                for query in queries
+-            ]
+-        )
+-        seen_ids: set[str] = set()
+-        ranked_items: list[dict] = []
+-        for items in batches:
+-            for item in items:
+-                item_id = item.get("id")
+-                if not item_id or item_id in seen_ids:
+-                    continue
+-                seen_ids.add(item_id)
+-                ranked_items.append(item)
++    candidates: list[BookResponse] = []
++    if not isinstance(google_result, Exception):
++        candidates.extend(google_result)
++    if not isinstance(open_library_result, Exception):
++        candidates.extend(open_library_result)
+ 
+-        ranked_items.sort(
+-            key=lambda item: _search_result_score(item, q.strip(), author),
+-            reverse=True,
+-        )
+-        books = [parse_book(item) for item in ranked_items[:max_results]]
+-        return await enrich_books_thumbnails([book for book in books if book is not None])
+-    except GoogleBooksUnavailable:
+-        query = f"{q.strip()} {author.strip()}" if has_text(author) else q.strip()
+-        books = await fetch_open_library_books_by_query(
+-            query,
+-            max_results=max_results,
+-            offset=offset,
+-        )
+-        books.sort(
+-            key=lambda book: _open_library_search_score(book, q.strip(), author),
+-            reverse=True,
+-        )
+-        return await enrich_books_thumbnails(books[:max_results])
++    candidates.sort(
++        key=lambda book: _book_search_score(book, q.strip(), author),
++        reverse=True,
++    )
++    ranked = dedupe_books(candidates)[:max_results]
++    return await enrich_books_thumbnails(ranked)
+ 
+ 
+ @app.get("/authors/search", response_model=list[AuthorResponse])
+@@ -1337,27 +1568,31 @@ async def recommend_books(
+         reference.categories = list(dict.fromkeys(reference.categories + enriched_subjects))
+ 
+     search_terms = build_search_terms(q, reference, category, enriched_subjects)
++    provider_tasks = [
++        fetch_open_library_candidates(
++            search_terms,
++            reference=reference,
++            max_results=60,
++            language=language,
++        )
++    ]
+     if google_available:
+-        try:
+-            thematic_candidates = await fetch_candidate_books(
++        provider_tasks.append(
++            fetch_candidate_books(
+                 search_terms,
+                 reference=reference,
+                 max_results=60,
++                language=language,
+             )
+-        except GoogleBooksUnavailable:
+-            google_available = False
+-            thematic_candidates = await fetch_open_library_candidates(
+-                search_terms,
+-                reference=reference,
+-                max_results=60,
+-            )
+-    else:
+-        thematic_candidates = await fetch_open_library_candidates(
+-            search_terms,
+-            reference=reference,
+-            max_results=60,
+         )
+ 
++    provider_results = await asyncio.gather(*provider_tasks, return_exceptions=True)
++    thematic_candidates: list[BookResponse] = []
++    for provider_result in provider_results:
++        if isinstance(provider_result, Exception):
++            continue
++        thematic_candidates.extend(provider_result)
++
+     candidates = dedupe_books(thematic_candidates)
+     reference_keys = set(_book_identity_keys(reference))
+     candidates = [
+@@ -1428,109 +1663,54 @@ def parse_book(item: dict) -> Optional[BookResponse]:
+ 
+ 
+ def _title_similarity(a: str, b: str) -> float:
+-    """
+-    Retorna score de similaridade entre dois títulos normalizados (0.0 a 1.0).
+-    Usa Jaccard sobre tokens para lidar com traduções parciais e abreviações.
+-    Exemplos:
+-      "duna" vs "dune"                           -> 0.0  (tokens diferentes)
+-      "1984" vs "nineteen eighty-four"           -> 0.0  (sem token comum)
+-      "do androids dream" vs "androids dream"    -> 0.67 (2/3 tokens em comum)
+-    """
+-    tokens_a = set(canonicalize_title(a).split())
+-    tokens_b = set(canonicalize_title(b).split())
+-    if not tokens_a or not tokens_b:
++    normalized_a = canonicalize_title(a)
++    normalized_b = canonicalize_title(b)
++    if not normalized_a or not normalized_b:
+         return 0.0
+-    intersection = tokens_a & tokens_b
+-    union = tokens_a | tokens_b
+-    return len(intersection) / len(union)
++    if normalized_a == normalized_b:
++        return 1.0
+ 
++    tokens_a = set(normalized_a.split())
++    tokens_b = set(normalized_b.split())
++    intersection = len(tokens_a & tokens_b)
++    union = len(tokens_a | tokens_b)
++    jaccard = intersection / union if union else 0.0
++    containment = intersection / min(len(tokens_a), len(tokens_b)) if intersection else 0.0
++    sequence_ratio = SequenceMatcher(None, normalized_a, normalized_b).ratio()
+ 
+-def _reference_score(item: dict, query: str) -> float:
+-    """
+-    Pontua um candidato a livro de referência.
+-
+-    Critérios:
+-    - Título exato                    : +10.0
+-    - Similaridade de tokens (Jaccard): +0 a +6.0
+-    - Tem description preenchida      : +3.0  (proxy de obra relevante)
+-    - Tem pageCount                   : +2.0
+-    - Tem thumbnail                   : +1.0
+-    - averageRating da API            : +0 a +1.0 (normalizado por 5.0)
+-    - ratingsCount deliberadamente EXCLUÍDO - enviesado por docs governamentais
+-    """
+-    info   = item.get("volumeInfo", {})
+-    title  = info.get("title", "")
+-    q_norm = canonicalize_title(query)
+-    score  = 0.0
+-
+-    if canonicalize_title(title) == q_norm:
+-        score += 10.0
+-    else:
+-        sim = _title_similarity(title, query)
+-        score += sim * 6.0
++    subset_score = 0.0
++    if tokens_a.issubset(tokens_b) or tokens_b.issubset(tokens_a):
++        extra_tokens = abs(len(tokens_a) - len(tokens_b))
++        subset_score = max(0.72, 0.92 - extra_tokens * 0.04)
+ 
+-    if info.get("description"):
+-        score += 3.0
+-    if info.get("pageCount"):
+-        score += 2.0
+-    if info.get("imageLinks", {}).get("thumbnail"):
+-        score += 1.0
++    return min(1.0, max(jaccard, containment * 0.84, sequence_ratio * 0.90, subset_score))
+ 
+-    avg_rating = info.get("averageRating")
+-    if avg_rating:
+-        score += (avg_rating / 5.0)
+ 
+-    return score
++def _reference_score(item: dict, query: str) -> float:
++    book = parse_book(item)
++    return _book_search_score(book, query) if book else 0.0
+ 
+ 
+ async def pick_best_reference(
+     query: str,
+     author: Optional[str] = None,
+ ) -> Optional[BookResponse]:
+-    """Resolve uma obra por título; autor apenas desambigua os candidatos."""
+-    queries: list[str] = []
+-    if has_text(author):
+-        queries.append(f'intitle:"{query.strip()}" inauthor:"{author.strip()}"')
+-    queries.append(f'intitle:"{query.strip()}"')
+-    if has_text(author):
+-        queries.append(f'{query.strip()} inauthor:"{author.strip()}"')
+-    queries.append(query.strip())
+-    queries = dedupe_preserve_order(queries)
+-
+-    batches = await asyncio.gather(
+-        *[fetch_google_books(search_query, max_results=20) for search_query in queries],
+-        return_exceptions=True,
++    """Resolve a melhor obra do Google Books com o mesmo ranking usado em /search."""
++    books = await _search_google_book_candidates(
++        query,
++        author,
++        max_results=20,
++        offset=0,
+     )
+-
+-    all_items: list[dict] = []
+-    seen_ids: set[str] = set()
+-    google_errors = 0
+-    for batch in batches:
+-        if isinstance(batch, GoogleBooksUnavailable):
+-            google_errors += 1
+-            continue
+-        if isinstance(batch, Exception):
+-            continue
+-        for item in batch:
+-            item_id = item.get("id")
+-            if not item_id or item_id in seen_ids:
+-                continue
+-            seen_ids.add(item_id)
+-            all_items.append(item)
+-
+-    if not all_items:
+-        if google_errors == len(batches) and batches:
+-            raise GoogleBooksUnavailable("Google Books temporariamente indisponível")
++    if not books:
+         return None
+ 
+-    ranked = sorted(
+-        all_items,
+-        key=lambda item: _search_result_score(item, query, author),
++    books.sort(
++        key=lambda book: _book_search_score(book, query, author),
+         reverse=True,
+     )
+-    best_book = parse_book(ranked[0])
+-    return await enrich_book_thumbnail(best_book) if best_book else None
++    return await enrich_book_thumbnail(books[0])
+ 
+ @app.get("/health")
+ async def health():
+-    return {"status": "ok", "version": "0.2.0", "api_key_set": bool(API_KEY)}
++    return {"status": "ok", "version": "0.3.0", "api_key_set": bool(API_KEY)}
+diff --git a/metadata_normalizer.py b/metadata_normalizer.py
+index c138d26..145c7df 100644
+--- a/metadata_normalizer.py
++++ b/metadata_normalizer.py
+@@ -39,39 +39,6 @@ _EDITION_MARKER_PATTERN = (
+     r"box set|paperback|hardcover"
+ )
+ 
+-_CATEGORY_ALIASES = {
+-    "fantasy": {
+-        "fantasy",
+-        "fantasia",
+-        "dark fantasy",
+-        "fantasia sombria",
+-        "epic fantasy",
+-        "fantasia epica",
+-    },
+-    "science_fiction": {
+-        "science fiction",
+-        "sci fi",
+-        "scifi",
+-        "ficcao cientifica",
+-        "ficcao especulativa",
+-        "speculative fiction",
+-    },
+-    "romance": {"romance", "romantic fiction", "ficcao romantica", "love stories"},
+-    "mystery": {"mystery", "misterio", "detective", "detective fiction"},
+-    "thriller": {"thriller", "suspense", "psychological thriller", "thriller psicologico"},
+-    "horror": {"horror", "terror", "gothic fiction", "ficcao gotica"},
+-    "historical_fiction": {"historical fiction", "ficcao historica", "romance historico"},
+-    "young_adult": {"young adult", "ya", "juvenile fiction", "ficcao juvenil"},
+-    "children": {"children", "childrens", "kids", "infantil", "literatura infantil"},
+-    "biography": {"biography", "biografia", "autobiography", "autobiografia", "memoir", "memorias"},
+-    "history": {"history", "historia", "historical", "historico"},
+-    "philosophy": {"philosophy", "filosofia", "philosophical", "filosofico"},
+-    "psychology": {"psychology", "psicologia", "psychological", "psicologico"},
+-    "poetry": {"poetry", "poesia", "poems", "poemas"},
+-    "self_help": {"self help", "self improvement", "autoajuda", "desenvolvimento pessoal"},
+-    "business": {"business", "negocios", "management", "administracao", "entrepreneurship", "empreendedorismo"},
+-}
+-
+ 
+ def _strip_diacritics(value: str) -> str:
+     decomposed = unicodedata.normalize("NFKD", value)
+@@ -140,38 +107,10 @@ def normalize_categories(categories: Iterable[str], limit: int = 6) -> list[str]
+ 
+ 
+ def categories_match(requested: Optional[str], categories: Iterable[str]) -> bool:
+-    """Compara categorias com normalização e aliases PT/EN comuns."""
+-    requested_normalized = normalize_text(requested)
+-    if not requested_normalized:
+-        return True
+-
+-    normalized_categories = [normalize_text(category) for category in categories or [] if category]
+-    if not normalized_categories:
+-        return False
++    """Compara categorias usando a taxonomia canônica e fallback textual."""
++    from taxonomy import category_filter_match
+ 
+-    requested_tokens = set(tokenize_text(requested_normalized))
+-    for category in normalized_categories:
+-        category_tokens = set(tokenize_text(category))
+-        if contains_normalized_phrase(category, requested_normalized):
+-            return True
+-        if requested_tokens and requested_tokens.issubset(category_tokens):
+-            return True
+-
+-    candidate_corpus = " ".join(normalized_categories)
+-    for aliases in _CATEGORY_ALIASES.values():
+-        normalized_aliases = {normalize_text(alias) for alias in aliases}
+-        belongs_to_group = requested_normalized in normalized_aliases or any(
+-            contains_normalized_phrase(requested_normalized, alias)
+-            or contains_normalized_phrase(alias, requested_normalized)
+-            for alias in normalized_aliases
+-        )
+-        if belongs_to_group and any(
+-            contains_normalized_phrase(candidate_corpus, alias)
+-            for alias in normalized_aliases
+-        ):
+-            return True
+-
+-    return False
++    return category_filter_match(requested, categories)
+ 
+ 
+ def clean_description(value: Optional[object], max_length: int = 900) -> str:
+diff --git a/models.py b/models.py
+index 0e34af5..0bcb10b 100644
+--- a/models.py
++++ b/models.py
+@@ -21,7 +21,9 @@ class BookResponse(BaseModel):
+ 
+ 
+ class ScoredBook(BookResponse):
+-    score: float  # 0.0 a 1.0 - similaridade normalizada com a obra de referência
++    score: float  # 0.0 a 1.0 - afinidade calibrada com a obra de referência
++    score_components: dict[str, float] = Field(default_factory=dict)
++    score_coverage: float = 0.0
+ 
+ 
+ class RecommendationResponse(BaseModel):
+diff --git a/taxonomy.py b/taxonomy.py
+new file mode 100644
+index 0000000..f71c90f
+--- /dev/null
++++ b/taxonomy.py
+@@ -0,0 +1,1002 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from functools import lru_cache
++from typing import Iterable, Literal
++
++from metadata_normalizer import contains_normalized_phrase, normalize_text
++
++CategoryKind = Literal["genre", "audience", "form", "topic"]
++
++
++@dataclass(frozen=True)
++class Taxon:
++    label: str
++    kind: CategoryKind
++    aliases: tuple[str, ...]
++    search_terms: tuple[str, ...]
++    parents: tuple[str, ...] = ()
++    families: tuple[str, ...] = ()
++    generic: bool = False
++
++
++# A taxonomia é controlada: cobre categorias frequentes nas APIs, mantém aliases
++# PT/EN e representa relações entre subgêneros sem apagar o metadado original.
++TAXONOMY: dict[str, Taxon] = {
++    "fiction": Taxon(
++        "Ficção",
++        "genre",
++        ("fiction", "ficcao"),
++        ("fiction",),
++        families=("fiction",),
++        generic=True,
++    ),
++    "literary_fiction": Taxon(
++        "Ficção literária",
++        "genre",
++        ("literary fiction", "ficcao literaria", "literatura ficcional"),
++        ("literary fiction",),
++        parents=("fiction",),
++        families=("fiction", "literary"),
++    ),
++    "historical_fiction": Taxon(
++        "Ficção histórica",
++        "genre",
++        ("historical fiction", "ficcao historica", "romance historico", "period fiction"),
++        ("historical fiction",),
++        parents=("fiction",),
++        families=("fiction", "historical"),
++    ),
++    "adventure": Taxon(
++        "Aventura",
++        "genre",
++        ("adventure", "adventure fiction", "aventura", "ficcao de aventura"),
++        ("adventure fiction", "adventure"),
++        parents=("fiction",),
++        families=("fiction", "adventure"),
++    ),
++    "fantasy": Taxon(
++        "Fantasia",
++        "genre",
++        ("fantasy", "fantasia", "fantasy fiction", "ficcao fantastica"),
++        ("fantasy",),
++        parents=("fiction",),
++        families=("fiction", "speculative"),
++    ),
++    "epic_fantasy": Taxon(
++        "Fantasia épica",
++        "genre",
++        (
++            "epic fantasy",
++            "high fantasy",
++            "fantasia epica",
++            "alta fantasia",
++            "fantasy epic",
++        ),
++        ("epic fantasy", "high fantasy"),
++        parents=("fantasy",),
++        families=("fiction", "speculative", "fantasy"),
++    ),
++    "dark_fantasy": Taxon(
++        "Fantasia sombria",
++        "genre",
++        ("dark fantasy", "fantasia sombria", "grimdark"),
++        ("dark fantasy", "grimdark"),
++        parents=("fantasy",),
++        families=("fiction", "speculative", "fantasy", "dark"),
++    ),
++    "urban_fantasy": Taxon(
++        "Fantasia urbana",
++        "genre",
++        (
++            "urban fantasy",
++            "fantasia urbana",
++            "contemporary fantasy",
++            "fantasy urban",
++        ),
++        ("urban fantasy",),
++        parents=("fantasy",),
++        families=("fiction", "speculative", "fantasy", "contemporary"),
++    ),
++    "magical_realism": Taxon(
++        "Realismo mágico",
++        "genre",
++        ("magical realism", "magic realism", "realismo magico", "realismo fantastico"),
++        ("magical realism",),
++        parents=("literary_fiction", "fantasy"),
++        families=("fiction", "literary", "speculative"),
++    ),
++    "science_fiction": Taxon(
++        "Ficção científica",
++        "genre",
++        (
++            "science fiction",
++            "science-fiction",
++            "sci fi",
++            "sci-fi",
++            "scifi",
++            "ficcao cientifica",
++            "ficcao especulativa cientifica",
++        ),
++        ("science fiction",),
++        parents=("fiction",),
++        families=("fiction", "speculative"),
++    ),
++    "space_opera": Taxon(
++        "Space opera",
++        "genre",
++        ("space opera", "opera espacial", "space adventure"),
++        ("space opera",),
++        parents=("science_fiction",),
++        families=("fiction", "speculative", "science_fiction"),
++    ),
++    "cyberpunk": Taxon(
++        "Cyberpunk",
++        "genre",
++        ("cyberpunk", "cyber punk", "tecno distopia", "tech noir"),
++        ("cyberpunk",),
++        parents=("science_fiction",),
++        families=("fiction", "speculative", "science_fiction", "dystopian"),
++    ),
++    "dystopia": Taxon(
++        "Distopia",
++        "genre",
++        ("dystopia", "dystopian", "dystopian fiction", "distopia", "ficcao distopica"),
++        ("dystopian fiction", "dystopia"),
++        parents=("science_fiction",),
++        families=("fiction", "speculative", "science_fiction", "dystopian"),
++    ),
++    "romance": Taxon(
++        "Romance",
++        "genre",
++        ("romance", "romance fiction", "romantic fiction", "ficcao romantica", "love stories"),
++        ("romance fiction", "romance"),
++        parents=("fiction",),
++        families=("fiction", "romance"),
++    ),
++    "historical_romance": Taxon(
++        "Romance de época",
++        "genre",
++        (
++            "historical romance",
++            "romance de epoca",
++            "romance historico de epoca",
++            "period romance",
++            "romance historical",
++        ),
++        ("historical romance",),
++        parents=("romance", "historical_fiction"),
++        families=("fiction", "romance", "historical"),
++    ),
++    "contemporary_romance": Taxon(
++        "Romance contemporâneo",
++        "genre",
++        (
++            "contemporary romance",
++            "romance contemporaneo",
++            "modern romance",
++            "romance contemporary",
++        ),
++        ("contemporary romance",),
++        parents=("romance",),
++        families=("fiction", "romance", "contemporary"),
++    ),
++    "paranormal_romance": Taxon(
++        "Romance paranormal",
++        "genre",
++        ("paranormal romance", "romance paranormal", "supernatural romance"),
++        ("paranormal romance",),
++        parents=("romance", "fantasy"),
++        families=("fiction", "romance", "speculative", "fantasy"),
++    ),
++    "mystery": Taxon(
++        "Mistério",
++        "genre",
++        ("mystery", "mystery fiction", "misterio", "detective fiction", "detective stories"),
++        ("mystery fiction", "detective fiction"),
++        parents=("fiction",),
++        families=("fiction", "crime_suspense"),
++    ),
++    "crime_fiction": Taxon(
++        "Ficção policial",
++        "genre",
++        (
++            "crime fiction",
++            "crime novel",
++            "policial",
++            "ficcao policial",
++            "romance policial",
++            "noir fiction",
++            "police procedural",
++            "mystery detective police procedural",
++            "thrillers crime",
++        ),
++        ("crime fiction", "detective fiction"),
++        parents=("fiction",),
++        families=("fiction", "crime_suspense"),
++    ),
++    "thriller": Taxon(
++        "Thriller",
++        "genre",
++        (
++            "thriller",
++            "thrillers",
++            "suspense",
++            "suspense fiction",
++            "thriller fiction",
++        ),
++        ("thriller", "suspense fiction"),
++        parents=("fiction",),
++        families=("fiction", "crime_suspense"),
++    ),
++    "psychological_thriller": Taxon(
++        "Thriller psicológico",
++        "genre",
++        (
++            "psychological thriller",
++            "thriller psicologico",
++            "psychological suspense",
++            "thriller psychological",
++            "thrillers psychological",
++        ),
++        ("psychological thriller",),
++        parents=("thriller",),
++        families=("fiction", "crime_suspense", "psychological"),
++    ),
++    "cozy_mystery": Taxon(
++        "Mistério cozy",
++        "genre",
++        (
++            "cozy mystery",
++            "cosy mystery",
++            "cozy mysteries",
++            "cozy crime",
++            "misterio cozy",
++            "mystery cozy",
++            "mystery detective cozy",
++        ),
++        ("cozy mystery",),
++        parents=("mystery",),
++        families=("fiction", "crime_suspense", "cozy"),
++    ),
++    "horror": Taxon(
++        "Terror",
++        "genre",
++        ("horror", "horror fiction", "terror", "ficcao de terror", "supernatural horror"),
++        ("horror fiction", "horror"),
++        parents=("fiction",),
++        families=("fiction", "speculative", "dark"),
++    ),
++    "gothic": Taxon(
++        "Gótico",
++        "genre",
++        ("gothic", "gothic fiction", "ficcao gotica", "literatura gotica"),
++        ("gothic fiction",),
++        parents=("horror",),
++        families=("fiction", "dark", "literary"),
++    ),
++    "humor": Taxon(
++        "Humor",
++        "genre",
++        ("humor", "humour", "comic fiction", "satire", "satira", "comedia"),
++        ("humorous fiction", "satire"),
++        parents=("fiction",),
++        families=("fiction", "humor"),
++    ),
++    "western": Taxon(
++        "Faroeste",
++        "genre",
++        ("western", "western fiction", "faroeste", "old west fiction"),
++        ("western fiction",),
++        parents=("fiction",),
++        families=("fiction", "adventure", "historical"),
++    ),
++    "young_adult": Taxon(
++        "Jovem adulto",
++        "audience",
++        ("young adult", "young adult fiction", "ya fiction", "ficcao juvenil", "literatura juvenil", "teen fiction"),
++        ("young adult fiction",),
++        families=("young_readers",),
++    ),
++    "children": Taxon(
++        "Infantil",
++        "audience",
++        (
++            "children",
++            "childrens fiction",
++            "children's fiction",
++            "kids",
++            "infantil",
++            "literatura infantil",
++            "juvenile fiction",
++        ),
++        ("children's fiction", "juvenile fiction"),
++        families=("young_readers",),
++    ),
++    "classics": Taxon(
++        "Clássicos",
++        "form",
++        ("classics", "classic literature", "classic fiction", "classicos", "literatura classica"),
++        ("classic literature",),
++        families=("literary",),
++    ),
++    "short_stories": Taxon(
++        "Contos",
++        "form",
++        ("short stories", "short story", "contos", "conto", "story collections"),
++        ("short stories",),
++        families=("literary",),
++    ),
++    "essays": Taxon(
++        "Ensaios",
++        "form",
++        ("essays", "essay collections", "ensaios", "coletanea de ensaios"),
++        ("essays",),
++        families=("literary", "nonfiction"),
++    ),
++    "drama": Taxon(
++        "Teatro e drama",
++        "form",
++        ("drama", "plays", "theater", "theatre", "teatro", "pecas teatrais"),
++        ("drama", "plays"),
++        families=("literary", "performing_arts"),
++    ),
++    "poetry": Taxon(
++        "Poesia",
++        "form",
++        ("poetry", "poems", "poesia", "poemas"),
++        ("poetry",),
++        families=("literary",),
++    ),
++    "graphic_novel": Taxon(
++        "Graphic novel",
++        "form",
++        (
++            "graphic novel",
++            "graphic novels",
++            "quadrinhos",
++            "historia em quadrinhos",
++            "comics",
++            "manga",
++        ),
++        ("graphic novels",),
++        families=("visual_narrative",),
++    ),
++    "biography": Taxon(
++        "Biografia",
++        "topic",
++        ("biography", "biographies", "biografia", "autobiography", "autobiografia"),
++        ("biography",),
++        families=("life_writing", "nonfiction"),
++    ),
++    "nonfiction": Taxon(
++        "Não ficção",
++        "topic",
++        ("nonfiction", "non-fiction", "nao ficcao", "general nonfiction"),
++        ("nonfiction",),
++        families=("nonfiction",),
++        generic=True,
++    ),
++    "memoir": Taxon(
++        "Memórias",
++        "topic",
++        ("memoir", "memoirs", "memorias", "personal narrative"),
++        ("memoir",),
++        parents=("biography",),
++        families=("life_writing", "nonfiction"),
++    ),
++    "history": Taxon(
++        "História",
++        "topic",
++        ("history", "historia", "world history", "social history", "military history"),
++        ("history",),
++        families=("humanities", "nonfiction", "historical"),
++    ),
++    "philosophy": Taxon(
++        "Filosofia",
++        "topic",
++        ("philosophy", "filosofia", "ethics", "etica", "metaphysics", "metafisica"),
++        ("philosophy",),
++        families=("humanities", "nonfiction"),
++    ),
++    "psychology": Taxon(
++        "Psicologia",
++        "topic",
++        ("psychology", "psicologia", "behavioral science", "cognitive psychology", "social psychology"),
++        ("psychology",),
++        parents=("social_science",),
++        families=("social_science", "nonfiction", "psychological"),
++    ),
++    "self_help": Taxon(
++        "Autoajuda",
++        "topic",
++        ("self help", "self improvement", "autoajuda", "desenvolvimento pessoal", "personal development"),
++        ("self-help", "personal development"),
++        families=("personal_development", "nonfiction"),
++    ),
++    "business": Taxon(
++        "Negócios",
++        "topic",
++        ("business", "negocios", "management", "gestao", "administracao", "entrepreneurship", "empreendedorismo"),
++        ("business", "management"),
++        families=("business", "nonfiction"),
++    ),
++    "economics": Taxon(
++        "Economia",
++        "topic",
++        ("economics", "economia", "finance", "financas", "economic policy"),
++        ("economics", "finance"),
++        parents=("business", "social_science"),
++        families=("business", "social_science", "nonfiction"),
++    ),
++    "science": Taxon(
++        "Ciência",
++        "topic",
++        ("science", "ciencia", "popular science", "natural sciences", "scientific"),
++        ("popular science", "science"),
++        families=("stem", "nonfiction"),
++    ),
++    "technology": Taxon(
++        "Tecnologia",
++        "topic",
++        ("technology", "tecnologia", "computer science", "computacao", "software", "programming", "programacao"),
++        ("technology", "computer science"),
++        families=("stem", "nonfiction"),
++    ),
++    "politics": Taxon(
++        "Política",
++        "topic",
++        ("politics", "politica", "political science", "government", "governo", "public policy"),
++        ("politics", "political science"),
++        parents=("social_science",),
++        families=("humanities", "social_science", "nonfiction"),
++    ),
++    "religion": Taxon(
++        "Religião",
++        "topic",
++        ("religion", "religiao", "theology", "teologia"),
++        ("religion", "theology"),
++        families=("humanities", "nonfiction"),
++    ),
++    "spirituality": Taxon(
++        "Espiritualidade",
++        "topic",
++        (
++            "spirituality",
++            "espiritualidade",
++            "body mind spirit",
++            "body mind and spirit",
++            "corpo mente e espirito",
++        ),
++        ("spirituality",),
++        families=("humanities", "personal_development", "nonfiction"),
++    ),
++    "true_crime": Taxon(
++        "True crime",
++        "topic",
++        ("true crime", "crime real", "criminal cases", "casos criminais"),
++        ("true crime",),
++        families=("crime_suspense", "nonfiction"),
++    ),
++    "social_science": Taxon(
++        "Ciências sociais",
++        "topic",
++        (
++            "social science",
++            "social sciences",
++            "ciencias sociais",
++            "sociology",
++            "sociologia",
++            "anthropology",
++            "antropologia",
++        ),
++        ("social science",),
++        families=("social_science", "nonfiction"),
++    ),
++    "education": Taxon(
++        "Educação",
++        "topic",
++        ("education", "educacao", "teaching", "ensino", "pedagogy", "pedagogia"),
++        ("education", "teaching"),
++        families=("social_science", "nonfiction"),
++    ),
++    "law": Taxon(
++        "Direito",
++        "topic",
++        ("law", "legal", "direito", "jurisprudence", "jurisprudencia", "legislation"),
++        ("law",),
++        families=("social_science", "nonfiction"),
++    ),
++    "health_medicine": Taxon(
++        "Saúde e medicina",
++        "topic",
++        (
++            "health",
++            "medicine",
++            "medical",
++            "saude",
++            "medicina",
++            "wellness",
++            "fitness",
++            "health and fitness",
++            "public health",
++        ),
++        ("health", "medicine"),
++        families=("stem", "health", "nonfiction"),
++    ),
++    "mathematics": Taxon(
++        "Matemática",
++        "topic",
++        ("mathematics", "math", "matematica", "statistics", "estatistica"),
++        ("mathematics",),
++        parents=("science",),
++        families=("stem", "nonfiction"),
++    ),
++    "nature_environment": Taxon(
++        "Natureza e meio ambiente",
++        "topic",
++        (
++            "nature",
++            "natural history",
++            "environment",
++            "environmental science",
++            "natureza",
++            "meio ambiente",
++            "ecology",
++            "ecologia",
++        ),
++        ("nature", "environment"),
++        parents=("science",),
++        families=("stem", "nature", "nonfiction"),
++    ),
++    "cooking": Taxon(
++        "Culinária",
++        "topic",
++        ("cooking", "cookbooks", "cookery", "culinaria", "receitas", "gastronomy", "gastronomia"),
++        ("cooking", "cookbooks"),
++        families=("lifestyle", "nonfiction"),
++    ),
++    "travel": Taxon(
++        "Viagem",
++        "topic",
++        ("travel", "travel writing", "travel guide", "viagem", "turismo", "guias de viagem"),
++        ("travel",),
++        families=("lifestyle", "places", "nonfiction"),
++    ),
++    "art_design": Taxon(
++        "Arte e design",
++        "topic",
++        (
++            "art",
++            "arts",
++            "arte",
++            "design",
++            "architecture",
++            "arquitetura",
++            "photography",
++            "fotografia",
++        ),
++        ("art", "design"),
++        families=("arts", "nonfiction"),
++    ),
++    "literary_criticism": Taxon(
++        "Crítica literária",
++        "topic",
++        (
++            "literary criticism",
++            "critica literaria",
++            "literary studies",
++            "estudos literarios",
++            "literature criticism",
++        ),
++        ("literary criticism",),
++        families=("humanities", "literary", "nonfiction"),
++    ),
++    "music": Taxon(
++        "Música",
++        "topic",
++        ("music", "musica", "music history", "music theory", "teoria musical"),
++        ("music",),
++        families=("arts", "performing_arts", "nonfiction"),
++    ),
++    "sports": Taxon(
++        "Esportes",
++        "topic",
++        ("sports", "sport", "esportes", "esporte", "athletics"),
++        ("sports",),
++        families=("lifestyle", "health", "nonfiction"),
++    ),
++    "crafts_hobbies": Taxon(
++        "Hobbies e artesanato",
++        "topic",
++        (
++            "crafts",
++            "hobbies",
++            "handicrafts",
++            "artesanato",
++            "passatempos",
++            "do it yourself",
++            "diy",
++        ),
++        ("crafts", "hobbies"),
++        families=("lifestyle", "nonfiction"),
++    ),
++    "language_linguistics": Taxon(
++        "Idiomas e linguística",
++        "topic",
++        (
++            "language",
++            "languages",
++            "linguistics",
++            "idiomas",
++            "linguistica",
++            "grammar",
++            "gramatica",
++        ),
++        ("linguistics", "language study"),
++        families=("humanities", "nonfiction"),
++    ),
++    "parenting": Taxon(
++        "Parentalidade",
++        "topic",
++        ("parenting", "parenthood", "parentalidade", "criacao de filhos", "family guidance"),
++        ("parenting",),
++        families=("personal_development", "family", "nonfiction"),
++    ),
++    "family_relationships": Taxon(
++        "Família e relacionamentos",
++        "topic",
++        (
++            "family and relationships",
++            "family relationships",
++            "familia e relacionamentos",
++            "relationships",
++            "relacionamentos",
++        ),
++        ("family relationships",),
++        families=("personal_development", "family", "nonfiction"),
++    ),
++    "reference": Taxon(
++        "Referência",
++        "topic",
++        (
++            "reference",
++            "reference books",
++            "encyclopedias",
++            "encyclopedia",
++            "dictionaries",
++            "dicionarios",
++        ),
++        ("reference",),
++        families=("reference", "nonfiction"),
++    ),
++    "mythology_folklore": Taxon(
++        "Mitologia e folclore",
++        "topic",
++        (
++            "mythology",
++            "myths",
++            "folklore",
++            "mitologia",
++            "mitos",
++            "folclore",
++            "fairy tales",
++            "contos de fadas",
++        ),
++        ("mythology", "folklore"),
++        families=("humanities", "speculative", "nonfiction"),
++    ),
++}
++
++_KIND_WEIGHTS: dict[CategoryKind, float] = {
++    "genre": 0.58,
++    "topic": 0.24,
++    "audience": 0.11,
++    "form": 0.07,
++}
++
++_EXPLICIT_RELATED: dict[frozenset[str], float] = {
++    frozenset(("mystery", "crime_fiction")): 0.78,
++    frozenset(("mystery", "thriller")): 0.66,
++    frozenset(("crime_fiction", "thriller")): 0.70,
++    frozenset(("fantasy", "gothic")): 0.58,
++    frozenset(("dark_fantasy", "horror")): 0.68,
++    frozenset(("literary_fiction", "historical_fiction")): 0.55,
++    frozenset(("literary_fiction", "classics")): 0.68,
++    frozenset(("biography", "history")): 0.45,
++    frozenset(("psychology", "self_help")): 0.52,
++    frozenset(("history", "politics")): 0.48,
++    frozenset(("magical_realism", "literary_fiction")): 0.86,
++    frozenset(("magical_realism", "fantasy")): 0.86,
++    frozenset(("western", "adventure")): 0.60,
++    frozenset(("cozy_mystery", "crime_fiction")): 0.72,
++    frozenset(("health_medicine", "psychology")): 0.48,
++    frozenset(("nature_environment", "science")): 0.72,
++    frozenset(("mythology_folklore", "religion")): 0.58,
++    frozenset(("mythology_folklore", "fantasy")): 0.62,
++    frozenset(("education", "psychology")): 0.44,
++    frozenset(("literary_fiction", "literary_criticism")): 0.52,
++    frozenset(("religion", "spirituality")): 0.72,
++    frozenset(("self_help", "spirituality")): 0.44,
++    frozenset(("parenting", "family_relationships")): 0.76,
++}
++
++
++@dataclass(frozen=True)
++class TaxonomyProfile:
++    genre: frozenset[str] = frozenset()
++    audience: frozenset[str] = frozenset()
++    form: frozenset[str] = frozenset()
++    topic: frozenset[str] = frozenset()
++
++    @property
++    def all_ids(self) -> frozenset[str]:
++        return self.genre | self.audience | self.form | self.topic
++
++    def by_kind(self, kind: CategoryKind) -> frozenset[str]:
++        return getattr(self, kind)
++
++
++@lru_cache(maxsize=512)
++def _normalized_aliases(taxon_id: str) -> tuple[str, ...]:
++    taxon = TAXONOMY[taxon_id]
++    aliases = {
++        normalize_text(taxon.label),
++        *(normalize_text(alias) for alias in taxon.aliases),
++    }
++    return tuple(
++        sorted(
++            (alias for alias in aliases if alias),
++            key=lambda value: (-len(value.split()), -len(value)),
++        )
++    )
++
++
++def category_ids_from_text(value: object) -> set[str]:
++    normalized = normalize_text(value)
++    if not normalized:
++        return set()
++
++    matches: list[tuple[str, str]] = []
++    for taxon_id in TAXONOMY:
++        for alias in _normalized_aliases(taxon_id):
++            if contains_normalized_phrase(normalized, alias):
++                matches.append((taxon_id, alias))
++                break
++
++    # Mantém os rótulos mais específicos. Sem isso, "science fiction" também
++    # viraria os taxons genéricos "science" e "fiction".
++    maximal_matches: set[str] = set()
++    for taxon_id, alias in matches:
++        shadowed = any(
++            other_alias != alias
++            and len(other_alias.split()) > len(alias.split())
++            and contains_normalized_phrase(other_alias, alias)
++            for _, other_alias in matches
++        )
++        if not shadowed:
++            maximal_matches.add(taxon_id)
++
++    return maximal_matches
++
++
++def taxonomy_profile(categories: Iterable[str] | str | None) -> TaxonomyProfile:
++    if isinstance(categories, str):
++        categories = [categories]
++
++    grouped: dict[CategoryKind, set[str]] = {
++        "genre": set(),
++        "audience": set(),
++        "form": set(),
++        "topic": set(),
++    }
++    for category in categories or []:
++        for taxon_id in category_ids_from_text(category):
++            grouped[TAXONOMY[taxon_id].kind].add(taxon_id)
++
++    for kind, taxon_ids in grouped.items():
++        if any(not TAXONOMY[taxon_id].generic for taxon_id in taxon_ids):
++            grouped[kind] = {
++                taxon_id
++                for taxon_id in taxon_ids
++                if not TAXONOMY[taxon_id].generic
++            }
++
++    return TaxonomyProfile(
++        genre=frozenset(grouped["genre"]),
++        audience=frozenset(grouped["audience"]),
++        form=frozenset(grouped["form"]),
++        topic=frozenset(grouped["topic"]),
++    )
++
++
++def _ancestors(taxon_id: str) -> set[str]:
++    found: set[str] = set()
++    pending = list(TAXONOMY[taxon_id].parents)
++    while pending:
++        parent = pending.pop()
++        if parent in found or parent not in TAXONOMY:
++            continue
++        found.add(parent)
++        pending.extend(TAXONOMY[parent].parents)
++    return found
++
++
++def taxon_pair_similarity(left_id: str, right_id: str) -> float:
++    if left_id == right_id:
++        if left_id not in TAXONOMY:
++            return 0.0
++        return 0.22 if TAXONOMY[left_id].generic else 1.0
++    if left_id not in TAXONOMY or right_id not in TAXONOMY:
++        return 0.0
++
++    left = TAXONOMY[left_id]
++    right = TAXONOMY[right_id]
++    if left.kind != right.kind:
++        return _EXPLICIT_RELATED.get(frozenset((left_id, right_id)), 0.0)
++
++    left_ancestors = _ancestors(left_id)
++    right_ancestors = _ancestors(right_id)
++    if right_id in left_ancestors or left_id in right_ancestors:
++        ancestor_id = right_id if right_id in left_ancestors else left_id
++        return 0.18 if TAXONOMY[ancestor_id].generic else 0.86
++
++    explicit = _EXPLICIT_RELATED.get(frozenset((left_id, right_id)))
++    if explicit is not None:
++        return explicit
++
++    common_ancestors = left_ancestors & right_ancestors
++    if common_ancestors:
++        if any(not TAXONOMY[ancestor].generic for ancestor in common_ancestors):
++            return 0.66
++        shared_specific_families = (
++            set(left.families) & set(right.families)
++        ) - {"fiction", "nonfiction"}
++        return 0.52 if shared_specific_families else 0.16
++
++    shared_families = (set(left.families) & set(right.families)) - {
++        "fiction",
++        "nonfiction",
++    }
++    if not shared_families:
++        return 0.12 if set(left.families) & set(right.families) else 0.0
++    if left.kind == "genre":
++        return 0.46 if "speculative" in shared_families or "crime_suspense" in shared_families else 0.34
++    return 0.38
++
++
++def _set_similarity(left: frozenset[str], right: frozenset[str]) -> float:
++    if not left or not right:
++        return 0.0
++
++    left_best = [max(taxon_pair_similarity(item, other) for other in right) for item in left]
++    right_best = [max(taxon_pair_similarity(item, other) for other in left) for item in right]
++    return (sum(left_best) / len(left_best) + sum(right_best) / len(right_best)) / 2
++
++
++def _cross_kind_similarity(left: TaxonomyProfile, right: TaxonomyProfile) -> float:
++    best = 0.0
++    for left_id in left.all_ids:
++        for right_id in right.all_ids:
++            if TAXONOMY[left_id].kind == TAXONOMY[right_id].kind:
++                continue
++            best = max(best, taxon_pair_similarity(left_id, right_id))
++    # Relações entre eixos diferentes são úteis, mas não equivalem a compartilhar
++    # o mesmo gênero/tema. O redutor impede que uma ponte isolada domine o score.
++    return best * 0.70
++
++
++def taxonomy_similarity(
++    left_categories: Iterable[str] | str | None,
++    right_categories: Iterable[str] | str | None,
++) -> float:
++    left = taxonomy_profile(left_categories)
++    right = taxonomy_profile(right_categories)
++
++    weighted_sum = 0.0
++    available_weight = 0.0
++    for kind, weight in _KIND_WEIGHTS.items():
++        left_values = left.by_kind(kind)
++        right_values = right.by_kind(kind)
++        if not left_values or not right_values:
++            continue
++        weighted_sum += _set_similarity(left_values, right_values) * weight
++        available_weight += weight
++
++    same_kind_score = weighted_sum / available_weight if available_weight else 0.0
++    return max(same_kind_score, _cross_kind_similarity(left, right))
++
++
++def category_filter_match(requested: str | None, categories: Iterable[str] | str | None) -> bool:
++    requested_normalized = normalize_text(requested)
++    if not requested_normalized:
++        return True
++
++    requested_ids = category_ids_from_text(requested_normalized)
++    candidate_profile = taxonomy_profile(categories)
++    candidate_ids = candidate_profile.all_ids
++    if requested_ids and candidate_ids:
++        for requested_id in requested_ids:
++            for candidate_id in candidate_ids:
++                if requested_id == candidate_id:
++                    return True
++                if requested_id in _ancestors(candidate_id) or candidate_id in _ancestors(requested_id):
++                    return True
++        return False
++
++    raw_categories = [categories] if isinstance(categories, str) else categories or []
++    candidate_values = [normalize_text(category) for category in raw_categories]
++    requested_tokens = set(requested_normalized.split())
++    for category in candidate_values:
++        if contains_normalized_phrase(category, requested_normalized):
++            return True
++        category_tokens = set(category.split())
++        if requested_tokens and requested_tokens.issubset(category_tokens):
++            return True
++    return False
++
++
++def taxonomy_search_terms(
++    categories: Iterable[str] | str | None,
++    *,
++    include_related: bool = True,
++    limit: int = 8,
++) -> list[str]:
++    profile = taxonomy_profile(categories)
++    ids = list(profile.genre) + list(profile.topic) + list(profile.audience) + list(profile.form)
++    ids.sort(key=lambda taxon_id: (TAXONOMY[taxon_id].generic, len(_ancestors(taxon_id)), taxon_id), reverse=True)
++
++    terms: list[str] = []
++    seen: set[str] = set()
++
++    def add_term(term: str) -> None:
++        normalized = normalize_text(term)
++        if not normalized or normalized in seen or len(terms) >= limit:
++            return
++        seen.add(normalized)
++        terms.append(term)
++
++    for taxon_id in ids:
++        taxon = TAXONOMY[taxon_id]
++        if taxon.generic:
++            continue
++        for term in taxon.search_terms[:2]:
++            add_term(term)
++
++    if include_related and len(terms) < limit:
++        for taxon_id in ids:
++            related = sorted(
++                (
++                    (other_id, taxon_pair_similarity(taxon_id, other_id))
++                    for other_id, other in TAXONOMY.items()
++                    if other.kind == TAXONOMY[taxon_id].kind and other_id != taxon_id
++                ),
++                key=lambda item: item[1],
++                reverse=True,
++            )
++            for other_id, similarity in related:
++                if similarity < 0.64:
++                    break
++                for term in TAXONOMY[other_id].search_terms[:1]:
++                    add_term(term)
++                if len(terms) >= limit:
++                    break
++            if len(terms) >= limit:
++                break
++
++    return terms[:limit]
++
++
++def category_labels(categories: Iterable[str] | str | None) -> list[str]:
++    profile = taxonomy_profile(categories)
++    ids = list(profile.genre) + list(profile.topic) + list(profile.audience) + list(profile.form)
++    return [TAXONOMY[taxon_id].label for taxon_id in ids]
++
++
++def category_options() -> list[str]:
++    """Rótulos canônicos disponíveis para filtros na interface."""
++    return [
++        taxon.label
++        for taxon in TAXONOMY.values()
++        if not taxon.generic
++    ]
+diff --git a/tests/test_api_contract.py b/tests/test_api_contract.py
+index 9ccf063..029c0dc 100644
+--- a/tests/test_api_contract.py
++++ b/tests/test_api_contract.py
+@@ -8,7 +8,7 @@ def test_health_and_version_contract() -> None:
+         response = client.get("/health")
+     assert response.status_code == 200
+     assert response.json()["status"] == "ok"
+-    assert response.json()["version"] == "0.2.0"
++    assert response.json()["version"] == "0.3.0"
+ 
+ 
+ def test_author_routes_are_exposed_in_openapi() -> None:
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 6b62cde..16a74e3 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -79,3 +79,212 @@ def test_cross_language_category_alias_contributes_to_score() -> None:
+     unrelated = make_book(id="unrelated", categories=["Cooking"])
+     unrelated_score = score_books([unrelated], reference)[0].score
+     assert score > unrelated_score
++
++
++def test_calibrated_score_separates_strong_and_unrelated_recommendations() -> None:
++    reference = make_book(
++        id="dune",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction", "Space Opera", "Dystopian Fiction"],
++        page_count=412,
++        published_year=1965,
++        description=(
++            "On a desert planet, political intrigue, ecology, religion and a struggle "
++            "for power shape the destiny of a young heir."
++        ),
++    )
++    strong = make_book(
++        id="left-hand",
++        title="The Left Hand of Darkness",
++        authors=["Ursula K. Le Guin"],
++        categories=["Science Fiction", "Space Opera"],
++        page_count=304,
++        published_year=1969,
++        description="An envoy reaches an alien world and confronts politics, identity and society.",
++    )
++    unrelated = make_book(
++        id="business",
++        title="Good to Great",
++        authors=["Jim Collins"],
++        categories=["Business", "Management"],
++        page_count=320,
++        published_year=2001,
++        description="Research on companies, leadership and management performance.",
++    )
++
++    scores = {book.id: book.score for book in score_books([strong, unrelated], reference)}
++    assert scores["left-hand"] >= 0.70
++    assert scores["business"] < 0.34
++
++
++def test_sparse_but_semantically_close_book_is_not_punished_as_missing_metadata() -> None:
++    reference = make_book(
++        id="reference",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction", "Space Opera"],
++        page_count=412,
++        published_year=1965,
++        description="A political and ecological struggle on a desert planet.",
++    )
++    sparse = make_book(
++        id="sparse",
++        title="Children of Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction"],
++        page_count=None,
++        published_year=None,
++        description="",
++    )
++
++    score = score_books([sparse], reference)[0].score
++    assert score >= 0.60
++
++
++def test_score_exposes_component_breakdown_and_metadata_coverage() -> None:
++    reference = make_book(id="reference", categories=["Science Fiction"])
++    candidate = make_book(id="candidate", categories=["Space Opera"])
++
++    scored = score_books([candidate], reference)[0]
++    assert scored.score_components["taxonomy"] >= 0.80
++    assert 0.0 < scored.score_coverage <= 1.0
++
++
++def test_generic_fiction_alone_stays_below_recommendation_cutoff() -> None:
++    reference = make_book(
++        id="reference",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction", "Space Opera"],
++        page_count=412,
++        published_year=1965,
++        description="A political and ecological struggle on a desert planet.",
++    )
++    generic = make_book(
++        id="generic",
++        title="An Unrelated Novel",
++        authors=["Another Author"],
++        categories=["Fiction"],
++        page_count=410,
++        published_year=1966,
++        description="A domestic story about an ordinary family in a small town.",
++    )
++
++    score = score_books([generic], reference)[0].score
++    assert score < 0.34
++
++
++def test_shared_nonfiction_umbrella_does_not_make_topics_recommendable() -> None:
++    reference = make_book(
++        id="business",
++        title="Business Strategy",
++        authors=["Author One"],
++        categories=["Business"],
++        page_count=300,
++        published_year=2000,
++        description="Leadership, companies, management and competitive strategy.",
++    )
++    candidate = make_book(
++        id="cookbook",
++        title="Home Cooking",
++        authors=["Author Two"],
++        categories=["Cooking"],
++        page_count=300,
++        published_year=2000,
++        description="Recipes, ingredients and kitchen techniques for home cooks.",
++    )
++
++    scored = score_books([candidate], reference)[0]
++    assert scored.score < 0.34
++    assert scored.score_components["taxonomy"] <= 0.12
++
++
++def test_raw_general_category_is_weak_evidence() -> None:
++    reference = make_book(
++        id="reference",
++        title="First Book",
++        authors=["Author One"],
++        categories=["General"],
++        description="A first unrelated description.",
++    )
++    candidate = make_book(
++        id="candidate",
++        title="Second Book",
++        authors=["Author Two"],
++        categories=["General"],
++        description="A completely different subject and vocabulary.",
++    )
++
++    scored = score_books([candidate], reference)[0]
++    assert scored.score_components["taxonomy"] == 0.18
++    assert scored.score < 0.34
++
++
++def test_calibration_orders_same_series_subgenre_adjacent_and_unrelated() -> None:
++    reference = make_book(
++        id="reference",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction", "Space Opera"],
++        page_count=412,
++        published_year=1965,
++        description=(
++            "A political and ecological struggle on a desert planet involving "
++            "religion, empire and a young heir."
++        ),
++    )
++    candidates = [
++        make_book(
++            id="same-series",
++            title="Dune Messiah",
++            authors=["Frank Herbert"],
++            categories=["Science Fiction", "Space Opera"],
++            page_count=256,
++            published_year=1969,
++            description=(
++                "Political intrigue, religion, empire and the consequences of power "
++                "on a desert world."
++            ),
++        ),
++        make_book(
++            id="same-subgenre",
++            title="Foundation",
++            authors=["Isaac Asimov"],
++            categories=["Science Fiction", "Space Opera"],
++            page_count=255,
++            published_year=1951,
++            description=(
++                "A galactic empire collapses while scientists preserve civilization "
++                "through history and politics."
++            ),
++        ),
++        make_book(
++            id="adjacent",
++            title="The Fifth Season",
++            authors=["N. K. Jemisin"],
++            categories=["Fantasy", "Science Fiction"],
++            page_count=468,
++            published_year=2015,
++            description=(
++                "A world of catastrophic ecology, oppression and power follows a "
++                "woman across a broken continent."
++            ),
++        ),
++        make_book(
++            id="unrelated",
++            title="Good to Great",
++            authors=["Jim Collins"],
++            categories=["Business"],
++            page_count=320,
++            published_year=2001,
++            description="Research on management, leadership and successful companies.",
++        ),
++    ]
++
++    scored = score_books(candidates, reference)
++    scores = {book.id: book.score for book in scored}
++
++    assert scores["same-series"] > scores["same-subgenre"] > scores["adjacent"]
++    assert scores["adjacent"] >= 0.55
++    assert scores["unrelated"] < 0.34
+diff --git a/tests/test_main_helpers.py b/tests/test_main_helpers.py
+index 62ed8ad..148bb84 100644
+--- a/tests/test_main_helpers.py
++++ b/tests/test_main_helpers.py
+@@ -124,3 +124,186 @@ def test_google_fetch_paginates_with_start_index(monkeypatch) -> None:
+     items = asyncio.run(main.fetch_google_books("pagination-test", max_results=45))
+     assert len(items) == 45
+     assert calls == [0, 40]
++
++
++def test_book_search_builds_isbn_query_before_title_queries() -> None:
++    assert main.build_book_search_queries("978-0-306-40615-7") == ["isbn:9780306406157"]
++
++
++def test_book_search_penalizes_study_guides_and_prefers_exact_author() -> None:
++    original = make_book(
++        id="original",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction"],
++        description="A desert planet and a struggle for power.",
++    )
++    study_guide = make_book(
++        id="guide",
++        title="Dune Study Guide and Workbook",
++        authors=["Other Author"],
++        categories=["Study Aids"],
++        description="Questions and summaries for students.",
++    )
++
++    original_score = main._book_search_score(original, "Dune", "Frank Herbert")
++    guide_score = main._book_search_score(study_guide, "Dune", "Frank Herbert")
++    assert original_score > guide_score
++
++
++def test_book_search_combines_google_and_open_library(monkeypatch) -> None:
++    calls: list[str] = []
++    google = make_book(
++        id="google",
++        provider="google_books",
++        title="Dune",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction"],
++    )
++    open_library = make_book(
++        id="/works/OL1W",
++        provider="open_library",
++        work_id="/works/OL1W",
++        title="Dune Messiah",
++        authors=["Frank Herbert"],
++        categories=["Science Fiction"],
++    )
++
++    async def fake_google(*_args, **_kwargs):
++        calls.append("google")
++        return [google]
++
++    async def fake_open_library(*_args, **_kwargs):
++        calls.append("open_library")
++        return [open_library]
++
++    async def passthrough(books):
++        return books
++
++    monkeypatch.setattr(main, "_search_google_book_candidates", fake_google)
++    monkeypatch.setattr(main, "_search_open_library_book_candidates", fake_open_library)
++    monkeypatch.setattr(main, "enrich_books_thumbnails", passthrough)
++
++    books = asyncio.run(
++        main.search_books(q="Dune", author="Frank Herbert", max_results=10, offset=0)
++    )
++    assert calls == ["google", "open_library"]
++    assert [book.id for book in books] == ["google", "/works/OL1W"]
++
++
++def test_deduplication_merges_complementary_provider_metadata() -> None:
++    google = make_book(
++        id="google",
++        provider="google_books",
++        edition_id="google",
++        isbn_13=["9780306406157"],
++        categories=["Science Fiction"],
++        description="Short description.",
++        thumbnail=None,
++        page_count=None,
++    )
++    open_library = make_book(
++        id="/works/OL1W",
++        provider="open_library",
++        work_id="/works/OL1W",
++        edition_id="/books/OL2M",
++        isbn_13=["9780306406157"],
++        categories=["Space Opera"],
++        description="A longer and more useful description from the second provider.",
++        thumbnail="https://example.test/cover.jpg",
++        page_count=412,
++    )
++
++    merged = main.dedupe_books([google, open_library])
++    assert len(merged) == 1
++    assert merged[0].id == "google"
++    assert merged[0].work_id == "/works/OL1W"
++    assert merged[0].page_count == 412
++    assert merged[0].categories == ["Science Fiction", "Space Opera"]
++    assert merged[0].description == open_library.description
++    assert merged[0].thumbnail == open_library.thumbnail
++
++
++def test_candidate_language_is_only_restricted_when_user_requests_it(monkeypatch) -> None:
++    google_languages: list[str | None] = []
++    open_library_languages: list[str | None] = []
++
++    async def fake_google(_query, max_results=20, start_index=0, language=None):
++        del max_results, start_index
++        google_languages.append(language)
++        return []
++
++    async def fake_open_library(_subject, author=None, language=None, max_results=20):
++        del author, max_results
++        open_library_languages.append(language)
++        return []
++
++    monkeypatch.setattr(main, "fetch_google_books", fake_google)
++    monkeypatch.setattr(main, "fetch_open_library_books_by_subject", fake_open_library)
++
++    asyncio.run(main.fetch_candidate_books(["science fiction"], language=None))
++    asyncio.run(main.fetch_candidate_books(["science fiction"], language="pt"))
++    asyncio.run(main.fetch_open_library_candidates(["science fiction"], language=None))
++    asyncio.run(main.fetch_open_library_candidates(["science fiction"], language="pt"))
++
++    assert google_languages == [None, None, "pt", "pt"]
++    assert open_library_languages == [None, "pt"]
++
++
++def test_open_library_uses_two_letter_language_as_result_preference(monkeypatch) -> None:
++    captured: list[dict] = []
++
++    async def fake_search(params: dict):
++        captured.append(params)
++        return []
++
++    monkeypatch.setattr(main, "fetch_open_library_search", fake_search)
++    asyncio.run(
++        main.fetch_open_library_books_by_subject(
++            "science fiction",
++            language="por",
++            max_results=5,
++        )
++    )
++
++    assert captured[0]["lang"] == "pt"
++    assert "language" not in captured[0]
++
++
++def test_open_library_isbn_search_uses_isbn_field(monkeypatch) -> None:
++    captured: dict = {}
++
++    async def fake_search(params: dict) -> list[dict]:
++        captured.update(params)
++        return []
++
++    monkeypatch.setattr(main, "fetch_open_library_search", fake_search)
++    books = asyncio.run(
++        main.fetch_open_library_books_by_isbn(
++            "978-0-306-40615-7",
++            max_results=7,
++            offset=3,
++        )
++    )
++
++    assert books == []
++    assert captured["isbn"] == "9780306406157"
++    assert captured["limit"] == 7
++    assert captured["offset"] == 3
++
++
++def test_interleave_book_batches_preserves_query_diversity() -> None:
++    first = [make_book(id=f"first-{index}") for index in range(3)]
++    second = [make_book(id=f"second-{index}") for index in range(2)]
++    third = [make_book(id="third-0")]
++
++    interleaved = main.interleave_book_batches([first, second, third])
++
++    assert [book.id for book in interleaved] == [
++        "first-0",
++        "second-0",
++        "third-0",
++        "first-1",
++        "second-1",
++        "first-2",
++    ]
+diff --git a/tests/test_taxonomy.py b/tests/test_taxonomy.py
+new file mode 100644
+index 0000000..47d5254
+--- /dev/null
++++ b/tests/test_taxonomy.py
+@@ -0,0 +1,118 @@
++from taxonomy import (
++    category_filter_match,
++    taxonomy_profile,
++    taxonomy_search_terms,
++    taxonomy_similarity,
++)
++
++
++def test_taxonomy_normalizes_portuguese_english_and_subgenres() -> None:
++    profile = taxonomy_profile(
++        ["Ficção científica", "Space Opera", "Literatura juvenil"]
++    )
++    assert "science_fiction" in profile.genre
++    assert "space_opera" in profile.genre
++    assert "young_adult" in profile.audience
++
++
++def test_subgenre_filter_matches_parent_genre_in_both_directions() -> None:
++    assert category_filter_match("fantasia sombria", ["Fantasy"])
++    assert category_filter_match("fantasia", ["Dark Fantasy"])
++
++
++def test_related_genres_score_higher_than_unrelated_topics() -> None:
++    related = taxonomy_similarity(["Science Fiction"], ["Dystopian Fiction"])
++    unrelated = taxonomy_similarity(["Science Fiction"], ["Business"])
++    assert related >= 0.80
++    assert unrelated == 0.0
++
++
++def test_taxonomy_generates_provider_friendly_search_terms() -> None:
++    terms = taxonomy_search_terms(["Ficção científica"], include_related=True, limit=5)
++    assert terms[0] == "science fiction"
++    assert any(term in terms for term in {"space opera", "dystopian fiction", "cyberpunk"})
++
++
++def test_specific_alias_does_not_add_generic_or_unrelated_taxons() -> None:
++    profile = taxonomy_profile(["Science Fiction"])
++    assert profile.genre == frozenset({"science_fiction"})
++    assert not profile.topic
++
++
++def test_portuguese_historical_romance_label_is_unambiguous() -> None:
++    from taxonomy import category_options
++
++    profile = taxonomy_profile(["Romance de época"])
++    assert profile.genre == frozenset({"historical_romance"})
++    assert "Romance de época" in category_options()
++
++
++def test_common_nonfiction_categories_are_canonicalized() -> None:
++    profile = taxonomy_profile(
++        ["Cookbooks", "Public Health", "Environmental Science", "Social Sciences"]
++    )
++    assert profile.topic == frozenset(
++        {"cooking", "health_medicine", "nature_environment", "social_science"}
++    )
++
++
++def test_specific_multword_category_shadows_generic_science() -> None:
++    assert taxonomy_profile(["Computer Science"]).topic == frozenset({"technology"})
++    assert taxonomy_profile(["Environmental Science"]).topic == frozenset(
++        {"nature_environment"}
++    )
++
++
++def test_new_subgenres_keep_parent_relationships() -> None:
++    assert taxonomy_similarity(["Urban Fantasy"], ["Dark Fantasy"]) >= 0.60
++    assert taxonomy_similarity(["Cozy Mystery"], ["Mystery"]) >= 0.80
++    assert taxonomy_similarity(["Romance paranormal"], ["Fantasy"]) >= 0.80
++
++
++def test_provider_categories_do_not_collapse_into_adjacent_topics() -> None:
++    assert taxonomy_profile(["Literary Criticism"]).topic == frozenset(
++        {"literary_criticism"}
++    )
++    assert taxonomy_profile(["Health & Fitness"]).topic == frozenset(
++        {"health_medicine"}
++    )
++    assert taxonomy_profile(["Family & Relationships"]).topic == frozenset(
++        {"family_relationships"}
++    )
++    assert taxonomy_profile(["Body, Mind & Spirit"]).topic == frozenset(
++        {"spirituality"}
++    )
++
++
++def test_generic_nonfiction_is_removed_when_specific_topic_exists() -> None:
++    assert taxonomy_profile(["Nonfiction / Psychology"]).topic == frozenset(
++        {"psychology"}
++    )
++
++
++def test_common_provider_hierarchies_resolve_to_specific_subgenres() -> None:
++    cases = {
++        "FICTION / Fantasy / Epic": {"epic_fantasy"},
++        "FICTION / Fantasy / Urban": {"urban_fantasy"},
++        "FICTION / Romance / Historical / General": {"historical_romance"},
++        "FICTION / Romance / Contemporary": {"contemporary_romance"},
++        "FICTION / Thrillers / Psychological": {"psychological_thriller"},
++        "FICTION / Mystery & Detective / Cozy": {"cozy_mystery"},
++        "FICTION / Mystery & Detective / Police Procedural": {"crime_fiction"},
++    }
++
++    for raw_category, expected in cases.items():
++        profile = taxonomy_profile([raw_category])
++        assert expected.issubset(profile.genre), (raw_category, profile)
++
++
++def test_curated_cross_kind_bridges_are_weaker_than_same_kind_matches() -> None:
++    fantasy_mythology = taxonomy_similarity(["Fantasy"], ["Mythology"])
++    exact_fantasy = taxonomy_similarity(["Fantasy"], ["Fantasy"])
++    literary_criticism = taxonomy_similarity(
++        ["Literary Fiction"],
++        ["Literary Criticism"],
++    )
++
++    assert 0.40 <= fantasy_mythology < exact_fantasy
++    assert 0.0 < literary_criticism < fantasy_mythology
+diff --git a/tests/test_ui_source.py b/tests/test_ui_source.py
+new file mode 100644
+index 0000000..4798924
+--- /dev/null
++++ b/tests/test_ui_source.py
+@@ -0,0 +1,26 @@
++from pathlib import Path
++
++
++def test_intro_cards_and_defensive_copy_were_removed() -> None:
++    source = Path("cli.py").read_text(encoding="utf-8")
++    assert "def render_intro" not in source
++    assert "hero-block" not in source
++    assert "chip-card" not in source
++    assert "primeiro resultado" not in source.casefold()
++    assert "escolhida explicitamente" not in source.casefold()
++    assert "Você pode digitar para localizar opções" not in source
++    assert "este texto tem prioridade" not in source
++    assert "política mais permissiva" not in source
++
++
++def test_recommendation_score_is_presented_as_affinity_percentage() -> None:
++    source = Path("cli.py").read_text(encoding="utf-8")
++    assert 'Afinidade {book["score"]:.0%}' in source
++    assert '>Score ' not in source
++
++
++def test_book_search_exposes_incremental_pagination() -> None:
++    source = Path("cli.py").read_text(encoding="utf-8")
++    assert 'st.button("Carregar mais resultados"' in source
++    assert '"reference_offset": 0' in source
++    assert "merge_reference_candidate_pages" in source

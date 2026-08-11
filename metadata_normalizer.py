@@ -1,6 +1,7 @@
 import re
+import unicodedata
 from html import unescape
-from typing import Optional
+from typing import Iterable, Optional
 
 from models import BookResponse
 
@@ -32,9 +33,44 @@ _LANGUAGE_ALIASES = {
     "rus": "ru",
 }
 
+_EDITION_MARKER_PATTERN = (
+    r"edition|edicao|revised edition|updated edition|illustrated edition|"
+    r"anniversary edition|special edition|deluxe edition|collector'?s edition|"
+    r"box set|paperback|hardcover"
+)
 
-def normalize_text(value: Optional[str]) -> str:
-    return value.casefold().strip() if value else ""
+
+def _strip_diacritics(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def normalize_text(value: Optional[object]) -> str:
+    """Normaliza texto para comparação sem alterar o valor exibido ao usuário."""
+    if value is None:
+        return ""
+
+    text = _strip_diacritics(unescape(str(value)).casefold())
+    text = text.replace("_", " ")
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_person_name(value: Optional[str]) -> str:
+    """Normaliza pontuação e iniciais: J. R. R. Tolkien == J.R.R. Tolkien."""
+    return normalize_text(value)
+
+
+def tokenize_text(value: Optional[object]) -> list[str]:
+    return [token for token in normalize_text(value).split(" ") if token]
+
+
+def contains_normalized_phrase(text: Optional[object], phrase: Optional[object]) -> bool:
+    normalized_text = normalize_text(text)
+    normalized_phrase = normalize_text(phrase)
+    if not normalized_text or not normalized_phrase:
+        return False
+    return f" {normalized_phrase} " in f" {normalized_text} "
 
 
 def has_text(value: Optional[str]) -> bool:
@@ -46,12 +82,15 @@ def normalize_language_code(value: Optional[str]) -> str:
     return _LANGUAGE_ALIASES.get(normalized, normalized)
 
 
-def normalize_categories(categories: list[str], limit: int = 6) -> list[str]:
+def normalize_categories(categories: Iterable[str], limit: int = 6) -> list[str]:
+    if isinstance(categories, str):
+        categories = [categories]
+
     normalized_categories: list[str] = []
     seen: set[str] = set()
 
     for category in categories or []:
-        raw_parts = re.split(r"\s*/\s*|\s*>\s*|\s+\|\s+", category)
+        raw_parts = re.split(r"\s*/\s*|\s*>\s*|\s+\|\s+", str(category))
         for part in raw_parts:
             cleaned = re.sub(r"\s+", " ", part).strip(" -:/")
             if not cleaned:
@@ -65,6 +104,13 @@ def normalize_categories(categories: list[str], limit: int = 6) -> list[str]:
                 return normalized_categories
 
     return normalized_categories
+
+
+def categories_match(requested: Optional[str], categories: Iterable[str]) -> bool:
+    """Compara categorias usando a taxonomia canônica e fallback textual."""
+    from taxonomy import category_filter_match
+
+    return category_filter_match(requested, categories)
 
 
 def clean_description(value: Optional[object], max_length: int = 900) -> str:
@@ -98,19 +144,45 @@ def clean_description(value: Optional[object], max_length: int = 900) -> str:
 
 
 def canonicalize_title(title: str) -> str:
-    normalized = normalize_text(title)
-    normalized = re.sub(r"\(.*?\)|\[.*?\]", " ", normalized)
-    normalized = re.split(r"[:\-|/]", normalized, maxsplit=1)[0]
-    normalized = re.sub(
-        r"\b(edition|edicao|edição|revised|updated|illustrated|illustrado|illustrated edition|anniversary|special edition|collector'?s edition|box set|paperback|hardcover)\b",
+    """
+    Remove apenas marcadores explícitos de edição.
+
+    Não corta todo texto depois de ':' ou '-', pois esses caracteres fazem parte
+    de títulos legítimos como "Catch-22" e "Spider-Man: Blue".
+    """
+    structured = _strip_diacritics(unescape(title or "").casefold())
+    structured = re.sub(r"\s+", " ", structured).strip()
+
+    structured = re.sub(
+        rf"\((?=[^)]*\b(?:{_EDITION_MARKER_PATTERN})\b)[^)]*\)",
         " ",
-        normalized,
+        structured,
     )
-    normalized = re.sub(r"\b(book|livro|volume|vol\.?)\s+\d+\b", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized
+    structured = re.sub(
+        rf"\[(?=[^]]*\b(?:{_EDITION_MARKER_PATTERN})\b)[^]]*\]",
+        " ",
+        structured,
+    )
+    structured = re.sub(
+        rf"\s*(?::|\||\s-\s)\s*(?=[^:|]*\b(?:{_EDITION_MARKER_PATTERN})\b).*$",
+        "",
+        structured,
+    )
+    structured = re.sub(
+        rf"\s+(?:\d+[a-z]?\s+)?(?:{_EDITION_MARKER_PATTERN})\s*$",
+        "",
+        structured,
+    )
+    return normalize_text(structured)
+
+
+def normalize_isbn(value: Optional[str]) -> str:
+    normalized = re.sub(r"[^0-9Xx]", "", value or "").upper()
+    return normalized if len(normalized) in {10, 13} else ""
 
 
 def normalize_book_signature(book: BookResponse) -> str:
-    author = normalize_text(book.authors[0]) if book.authors else ""
-    return f"{canonicalize_title(book.title)}::{author}"
+    authors = "|".join(
+        sorted(normalize_person_name(author) for author in book.authors if normalize_person_name(author))
+    )
+    return f"{canonicalize_title(book.title)}::{authors}"

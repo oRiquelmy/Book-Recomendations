@@ -1,11 +1,9 @@
-import re
 from collections import Counter
 from dataclasses import dataclass
 
-from metadata_normalizer import normalize_text
+from metadata_normalizer import contains_normalized_phrase, normalize_text, tokenize_text
 from models import BookResponse
-
-_TOKEN_PATTERN = re.compile(r"\b[\wA-Za-zÀ-ÿ'-]{3,}\b")
+from taxonomy import taxonomy_profile
 
 _STOPWORDS = {
     "about",
@@ -99,7 +97,7 @@ _THEME_KEYWORDS = {
     },
     "politics": {
         "activism", "ativismo", "estado", "government", "governo", "politica",
-        "political", "politics", "power", "poder", "revolution", "revolucao", "state",
+        "political", "politics", "revolution", "revolucao", "state",
     },
     "social_critique": {
         "bourgeois", "burguesia", "capitalism", "capitalismo", "class inequality",
@@ -123,7 +121,7 @@ _THEME_KEYWORDS = {
         "psychological", "psychology", "psicologico", "psyche", "trauma",
     },
     "history": {
-        "era", "historical", "historico", "historia", "history", "period drama",
+        "historical", "historico", "historia", "history", "period drama",
         "period piece",
     },
     "war": {
@@ -139,8 +137,8 @@ _THEME_KEYWORDS = {
         "dragon", "epic fantasy", "fantasia", "fantasy", "kingdom", "magic", "magia", "magical", "reino", "sorcery",
     },
     "science_fiction": {
-        "alien", "android", "ciencia ficcao", "dystopian future", "future", "futuristic",
-        "science fiction", "scifi", "space", "speculative fiction",
+        "alien", "android", "ciencia ficcao", "ficcao cientifica", "dystopian future",
+        "future", "futuristic", "science fiction", "scifi", "space", "speculative fiction",
     },
     "dystopia": {
         "authoritarian", "distopia", "dystopia", "oppression", "opressao", "regime", "surveillance", "totalitarian",
@@ -151,7 +149,7 @@ _THEME_KEYWORDS = {
     },
     "science": {
         "astronomy", "biology", "ciencia", "cientifico", "experiment", "mathematics",
-        "physics", "pesquisa", "research", "science", "scientific",
+        "physics", "science", "scientific",
     },
     "religion": {
         "church", "faith", "god", "mythology", "religiao", "religion", "sacred", "spiritual",
@@ -178,11 +176,12 @@ _NARRATIVE_KEYWORDS = {
 
 _CATEGORY_KIND_KEYWORDS = {
     "literary_fiction": {
-        "classic fiction", "classics", "contemporary fiction", "fiction", "literary", "literary fiction",
-        "literature", "novel", "romance",
+        "classic fiction", "classics", "contemporary literary fiction", "literary",
+        "literary fiction", "literature",
     },
     "genre_fiction": {
-        "crime fiction", "fantasy", "horror", "mystery", "science fiction", "speculative", "suspense", "thriller",
+        "crime fiction", "fantasy", "ficcao cientifica", "ficcao especulativa", "horror",
+        "mystery", "science fiction", "speculative", "suspense", "thriller",
     },
     "nonfiction": {
         "autobiography", "biography", "essays", "history", "memoir", "nonfiction", "politics", "true crime",
@@ -216,6 +215,61 @@ _SERIES_TERMS = {
     "book", "livro", "volume", "vol", "part", "parte", "series", "serie", "saga", "chronicles",
 }
 
+_THEME_BY_TAXON = {
+    "adventure": "adventure",
+    "fantasy": "fantasy",
+    "epic_fantasy": "fantasy",
+    "dark_fantasy": "fantasy",
+    "urban_fantasy": "fantasy",
+    "magical_realism": "fantasy",
+    "science_fiction": "science_fiction",
+    "space_opera": "science_fiction",
+    "cyberpunk": "technology",
+    "dystopia": "dystopia",
+    "romance": "love",
+    "historical_romance": "love",
+    "contemporary_romance": "love",
+    "paranormal_romance": "love",
+    "mystery": "mystery",
+    "crime_fiction": "mystery",
+    "thriller": "mystery",
+    "psychological_thriller": "psychology",
+    "cozy_mystery": "mystery",
+    "western": "adventure",
+    "history": "history",
+    "philosophy": "philosophy",
+    "psychology": "psychology",
+    "science": "science",
+    "technology": "technology",
+    "politics": "politics",
+    "religion": "religion",
+    "spirituality": "religion",
+    "social_science": "social_critique",
+    "law": "politics",
+    "nature_environment": "science",
+    "mythology_folklore": "religion",
+    "family_relationships": "family",
+}
+
+_GENRE_FICTION_TAXONS = {
+    "fantasy", "epic_fantasy", "dark_fantasy", "urban_fantasy", "magical_realism",
+    "science_fiction", "space_opera", "cyberpunk", "dystopia", "romance",
+    "historical_romance", "contemporary_romance", "paranormal_romance", "mystery",
+    "crime_fiction", "thriller", "psychological_thriller", "cozy_mystery",
+    "horror", "gothic", "adventure", "humor", "western",
+}
+_LITERARY_TAXONS = {"literary_fiction", "historical_fiction", "classics", "short_stories"}
+_TECHNICAL_TAXONS = {"science", "technology", "mathematics", "health_medicine"}
+_NONFICTION_TAXONS = {
+    "biography", "memoir", "history", "philosophy", "psychology", "self_help",
+    "nonfiction", "business", "economics", "science", "technology", "politics", "religion",
+    "spirituality",
+    "true_crime", "social_science", "education", "law", "health_medicine",
+    "mathematics", "nature_environment", "cooking", "travel", "art_design",
+    "music", "sports", "crafts_hobbies", "language_linguistics", "parenting",
+    "family_relationships", "literary_criticism", "reference", "mythology_folklore", "essays",
+}
+
 
 @dataclass(frozen=True)
 class BookProfile:
@@ -229,11 +283,11 @@ class BookProfile:
 
 
 def _build_corpus_parts(book: BookResponse) -> list[str]:
+    # Nome de autor não é sinal temático e pode gerar falsos positivos.
     return [
         book.title or "",
         book.description or "",
         *book.categories,
-        *book.authors,
     ]
 
 
@@ -242,7 +296,7 @@ def _build_corpus(book: BookResponse) -> str:
 
 
 def _tokenize(text: str) -> list[str]:
-    return _TOKEN_PATTERN.findall(normalize_text(text))
+    return [token for token in tokenize_text(text) if len(token) >= 3]
 
 
 def _is_keyword_candidate(token: str) -> bool:
@@ -262,7 +316,6 @@ def _extract_keywords(book: BookResponse, limit: int = 16) -> frozenset[str]:
         (book.title or "", 4),
         (" ".join(book.categories), 3),
         (book.description or "", 2),
-        (" ".join(book.authors), 1),
     ]
 
     scores: Counter[str] = Counter()
@@ -282,28 +335,60 @@ def _extract_keywords(book: BookResponse, limit: int = 16) -> frozenset[str]:
 def _match_labels(corpus: str, mapping: dict[str, set[str]]) -> frozenset[str]:
     matches: set[str] = set()
     for label, keywords in mapping.items():
-        if any(keyword in corpus for keyword in keywords):
+        if any(contains_normalized_phrase(corpus, keyword) for keyword in keywords):
             matches.add(label)
     return frozenset(matches)
 
 
 def extract_book_profile(book: BookResponse) -> BookProfile:
     corpus = normalize_text(_build_corpus(book))
+    taxonomy = taxonomy_profile(book.categories)
+
+    themes = set(_match_labels(corpus, _THEME_KEYWORDS))
+    for taxon_id in taxonomy.all_ids:
+        mapped_theme = _THEME_BY_TAXON.get(taxon_id)
+        if mapped_theme:
+            themes.add(mapped_theme)
+
+    category_kinds = set(_match_labels(corpus, _CATEGORY_KIND_KEYWORDS))
+    if taxonomy.all_ids & _GENRE_FICTION_TAXONS:
+        category_kinds.add("genre_fiction")
+    if taxonomy.all_ids & _LITERARY_TAXONS:
+        category_kinds.add("literary_fiction")
+    if taxonomy.all_ids & _NONFICTION_TAXONS:
+        category_kinds.add("nonfiction")
+    if taxonomy.all_ids & _TECHNICAL_TAXONS:
+        category_kinds.add("technical")
+
+    audiences = set(_match_labels(corpus, _AUDIENCE_KEYWORDS))
+    if "young_adult" in taxonomy.audience:
+        audiences.add("young_adult")
+    if "children" in taxonomy.audience:
+        audiences.add("children")
+
     return BookProfile(
-        themes=_match_labels(corpus, _THEME_KEYWORDS),
+        themes=frozenset(themes),
         tones=_match_labels(corpus, _TONE_KEYWORDS),
         narrative_markers=_match_labels(corpus, _NARRATIVE_KEYWORDS),
-        category_kinds=_match_labels(corpus, _CATEGORY_KIND_KEYWORDS),
-        audiences=_match_labels(corpus, _AUDIENCE_KEYWORDS),
+        category_kinds=frozenset(category_kinds),
+        audiences=frozenset(audiences),
         pace_markers=_match_labels(corpus, _PACE_KEYWORDS),
         keywords=_extract_keywords(book),
     )
 
 
 def _set_overlap(left: frozenset[str], right: frozenset[str]) -> float:
+    """Compara conjuntos esparsos sem a penalidade excessiva do Jaccard puro."""
     if not left or not right:
         return 0.0
-    return len(left & right) / len(left | right)
+
+    intersection = len(left & right)
+    if not intersection:
+        return 0.0
+
+    overlap = intersection / min(len(left), len(right))
+    dice = (2 * intersection) / (len(left) + len(right))
+    return 0.65 * overlap + 0.35 * dice
 
 
 def profile_component_scores(reference: BookProfile, candidate: BookProfile) -> dict[str, float]:

@@ -1,191 +1,201 @@
-# Book-it
+# Book-it Babi
 
-Aplicação de recomendação de livros com:
+Aplicação de descoberta e recomendação de livros com backend em FastAPI, interface em Streamlit e integração com Google Books e Open Library.
 
-- backend em `FastAPI`
-- interface web em `Streamlit`
-- busca em `Google Books` com fallback para `Open Library`
+Versão da API nesta rodada: `0.3.0`.
 
-O fluxo atual do app foi desenhado para reduzir ambiguidades:
+## O que mudou nesta revisão
 
-1. o usuário pesquisa um título
-2. o app mostra sugestões de obras-base
-3. a obra correta é selecionada visualmente
-4. a recomendação usa o `id` da obra escolhida
-5. resultados repetidos por edições muito parecidas são deduplicados
-
-## Principais recursos
-
-- seleção guiada da obra-base antes de recomendar similares
-- ordenação de sugestões para priorizar versões mais conhecidas em buscas vagas como `1984` e `Duna`
-- busca de recomendações com filtros por gênero, páginas, ano e limite
-- score de similaridade com título, categorias, autor, idioma, descrição, páginas e ano
-- deduplicação de edições parecidas no ranking final
-- fallback para Open Library quando Google Books estiver indisponível
+- busca por **Livro** e **Autor** são fluxos distintos
+- autor é resolvido como entidade da Open Library antes de carregar sua bibliografia
+- recomendações exigem uma obra-base concreta; apenas um nome de autor não escolhe mais o primeiro livro retornado
+- paginação foi adicionada às buscas de livros e autores
+- o modelo diferencia provider, Work, Edition e ISBNs
+- deduplicação prioriza ISBN, Work/Edition ID e só depois título + autores normalizados
+- taxonomia canônica PT/EN diferencia gênero, subgênero, público, formato e tema, incluindo categorias frequentes dos providers
+- busca de livros combina Google Books e Open Library, ranqueia o conjunto e mescla metadados duplicados
+- a preferência de idioma só é enviada aos providers quando o usuário a escolhe explicitamente
+- normalização trata acentos, pontuação, iniciais e aliases comuns de categoria
+- títulos como `Catch-22` e `Spider-Man: Blue` não são mais truncados
+- matching temático usa palavras/frases, evitando falsos positivos por substring
+- filtros de páginas e ano excluem metadados desconhecidos por padrão
+- afinidade é calibrada em `0.0` a `1.0` conforme a evidência disponível, sem punir metadados ausentes como incompatibilidade
+- cada recomendação expõe componentes do score e cobertura de metadados para inspeção
+- a interface removeu cards introdutórios e textos explicativos redundantes
+- clientes HTTP são reaproveitados em vez de recriados a cada chamada
+- dependências foram fixadas e uma suíte de regressão foi adicionada
 
 ## Requisitos
 
 - Python 3.10+
 
-Dependências atuais em [`requirements.txt`](.\requirements.txt):
-
-- `fastapi`
-- `uvicorn`
-- `httpx`
-- `pydantic`
-- `streamlit`
-
 ## Instalação
+
+Linux/macOS:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Para desenvolvimento e testes:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 ## Variáveis de ambiente
 
-Opcional:
+Configure `GOOGLE_BOOKS_API_KEY` em produção para identificar as requisições públicas ao Google Books. Sem a chave, o aplicativo ainda tenta o provider e mantém fallback para Open Library, mas fica mais sujeito a limites e indisponibilidade.
 
-- `GOOGLE_BOOKS_API_KEY`
+Outras opções:
 
-Ajustes úteis:
+| Variável | Padrão | Uso |
+|---|---:|---|
+| `BOOKIT_BASE_URL` | `http://localhost:8000` | Backend usado pelo Streamlit |
+| `BOOKIT_REQUEST_TIMEOUT_SECONDS` | `30` | Timeout do frontend |
+| `BOOKIT_CACHE_TTL_SECONDS` | `21600` | TTL do cache em memória |
+| `BOOKIT_CACHE_MAX_ITEMS` | `512` | Limite de itens em cache |
+| `BOOKIT_GOOGLE_COOLDOWN_SECONDS` | `900` | Cooldown após quota/indisponibilidade |
+| `BOOKIT_MIN_RECOMMENDATION_SCORE` | `0.34` | Afinidade mínima aceita |
+| `BOOKIT_MAX_SEARCH_TERMS` | `6` | Termos temáticos por recomendação |
+| `BOOKIT_HTTP_SSL_VERIFY` | `true` | Verificação TLS do backend |
 
-- `BOOKIT_BASE_URL`
-  URL do backend usada pelo Streamlit.
-  Padrão: `http://localhost:8000`
-- `BOOKIT_REQUEST_TIMEOUT_SECONDS`
-  Timeout do frontend ao chamar o backend.
-  Padrão: `30`
-- `BOOKIT_CACHE_TTL_SECONDS`
-  TTL do cache em memória no backend.
-  Padrão: `21600`
-- `BOOKIT_CACHE_MAX_ITEMS`
-  Quantidade máxima de itens em cache.
-  Padrão: `512`
-- `BOOKIT_GOOGLE_COOLDOWN_SECONDS`
-  Janela de cooldown quando Google Books devolve quota excedida.
-  Padrão: `900`
-- `BOOKIT_MIN_RECOMMENDATION_SCORE`
-  Score mínimo para um livro entrar nas recomendações.
-  Padrão: `0.18`
-- `BOOKIT_MAX_SEARCH_TERMS`
-  Quantidade máxima de termos temáticos usados na busca de candidatos.
-  Padrão: `4`
+## Execução
 
-Sem chave de API o servidor ainda funciona, mas o limite do Google Books tende a ser menor.
-
-## Como rodar
-
-Suba o backend:
+Backend:
 
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Em outro terminal, suba o web app:
+Frontend, em outro terminal:
 
 ```bash
 streamlit run cli.py
 ```
 
-## Fluxo do web app
+Também é possível usar `./start.sh` em ambientes que fornecem a variável `PORT`.
 
-1. preencher `Título do livro` e opcionalmente `Autor`
-2. clicar em `Encontrar obra-base`
-3. escolher uma capa na estante de referências
-4. clicar em `Buscar recomendações com esta obra`
-5. revisar a obra-base confirmada e os livros recomendados
+## Fluxos da interface
 
-Se o usuário informar apenas autor, o app ainda permite partir diretamente desse autor.
+### Livro
+
+1. informe o título
+2. use o autor apenas como desambiguação opcional
+3. confirme visualmente a obra-base
+4. configure filtros
+5. gere as recomendações
+
+### Autor
+
+1. pesquise o nome da pessoa
+2. selecione a entidade correta
+3. carregue a bibliografia
+4. escolha uma obra concreta
+5. gere recomendações a partir dela
 
 ## Endpoints
 
-### `GET /`
-
-Health simples do serviço.
-
 ### `GET /search`
 
-Busca sugestões de obras-base para a etapa guiada.
+Busca obras-base.
 
-Parâmetros:
+- `q`: título, termo ou ISBN obrigatório
+- `author`: desambiguação opcional
+- `max_results`: `1` a `40`
+- `offset`: paginação
 
-- `q`: título ou termo principal
-- `author`: autor opcional para refinar
-- `max_results`: quantidade máxima de sugestões
+### `GET /authors/search`
 
-Exemplo:
+Busca entidades de autor.
 
-```text
-GET /search?q=1984&author=George Orwell&max_results=8
-```
+- `q`: nome obrigatório
+- `limit`: `1` a `50`
+- `offset`: paginação
+
+### `GET /authors/{author_id}/works`
+
+Carrega obras de um autor da Open Library.
+
+- `author_name`: nome exibido, obrigatório
+- `limit`: `1` a `100`
+- `offset`: paginação
 
 ### `GET /recommend`
 
-Retorna recomendações similares.
+Recomenda livros a partir de uma obra-base.
 
 Parâmetros principais:
 
-- `reference_id`: id explícito da obra-base selecionada
-- `q`: título de apoio
-- `author`: autor de apoio
-- `category`
-- `min_pages`
-- `max_pages`
-- `min_year`
-- `max_year`
-- `limit`
+- `reference_id`: ID da obra selecionada
+- `q`: título usado quando não há `reference_id` ou como fallback
+- `author`: apenas para desambiguar o título
+- `category`, `language`
+- `min_pages`, `max_pages`
+- `min_year`, `max_year`
+- `exclude_same_author`
+- `include_unknown_metadata`: mantém livros sem páginas/ano apesar de filtros numéricos
+- `limit`: `1` a `20`
 
-Exemplos:
-
-```text
-GET /recommend?reference_id=zyTCAlFPjgYC&limit=5
-GET /recommend?reference_id=zyTCAlFPjgYC&category=Science%20Fiction&limit=8
-GET /recommend?q=1984&author=George%20Orwell&limit=5
-```
+Uma requisição apenas com `author` retorna `422`; use os endpoints de autor e selecione uma obra.
 
 ### `GET /health`
 
-Retorna status básico da API e informa se a chave do Google Books está configurada.
+Retorna status, versão da API e presença da chave do Google Books.
 
-## Estrutura do projeto
+## Modelo de livro
 
-```text
-Book-it/
-|- main.py          # backend FastAPI e lógica de busca/recomendação
-|- cli.py           # interface Streamlit
-|- filters.py       # filtros e score de similaridade
-|- models.py        # modelos Pydantic
-|- requirements.txt
-|- assets/
-```
+Além dos metadados de exibição, cada livro agora expõe:
 
-## Como a recomendação funciona hoje
+- `provider`: `google_books`, `open_library` ou `unknown`
+- `work_id`
+- `edition_id`
+- `isbn_10[]`
+- `isbn_13[]`
 
-De forma resumida:
+Esses campos evitam tratar Work, Edition e Volume como se fossem o mesmo identificador. Quando o mesmo livro aparece nos dois providers, categorias, descrição, capa, ISBNs e demais campos complementares são mesclados.
 
-1. resolve a obra-base a partir do `reference_id` selecionado ou por busca assistida
-2. enriquece subjects/categorias da referência
-3. busca candidatos temáticos em Google Books ou Open Library
-4. remove duplicatas e edições muito parecidas
-5. aplica filtros do usuário
-6. calcula score de similaridade
-7. devolve apenas livros acima do score mínimo
+As recomendações também incluem:
 
-Sinais usados no score:
+- `score`: afinidade calibrada entre `0.0` e `1.0`; não representa probabilidade
+- `score_components`: similaridade observada em taxonomia, temas, estilo, texto, autor, período, páginas, título e idioma
+- `score_coverage`: fração dos sinais para os quais havia metadado comparável
 
-- categorias em comum
-- mesmo autor
-- proximidade de páginas
-- proximidade de ano
-- idioma
-- similaridade de título
-- overlap de keywords da descrição
-- especificidade das categorias
+Faixas usadas na interface e na calibração:
 
-## Observações
+- `0.70–1.00`: afinidade forte
+- `0.50–0.69`: afinidade relevante
+- `0.34–0.49`: resultado exploratório
+- abaixo de `0.34`: descartado por padrão
 
-- a seleção guiada melhora bastante consultas vagas, mas ainda depende da qualidade dos metadados das APIs externas
-- ids do Google Books tendem a ser resolvidos com mais precisão do que ids do Open Library
-- recomendações podem variar conforme disponibilidade e metadados retornados pelas APIs externas
+Categorias amplas como `Fiction`, `Nonfiction`, `General` e `Literature` são evidência fraca. Elas não bastam, sozinhas, para sustentar uma recomendação.
+
+## Testes
+
+A suíte cobre regressões de:
+
+- acentos, pontuação e nomes com iniciais
+- preservação de títulos legítimos
+- aliases de categoria PT/EN e relações entre gênero/subgênero
+- geração de termos canônicos para os providers
+- categorias comuns dos providers, como `Literary Criticism`, `Health & Fitness`, `Family & Relationships` e `Body, Mind & Spirit`
+- falsos temas causados por substrings
+- filtros com metadados desconhecidos
+- calibração de afinidade para livros fortes, fracos e com metadados esparsos
+- componentes e cobertura do score
+- parsing de Work/Edition/ISBN
+- busca combinada e mesclagem de metadados entre providers
+- busca por ISBN nos dois providers
+- rejeição de recomendação somente por autor
+- paginação do Google Books por `startIndex`

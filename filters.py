@@ -1,19 +1,29 @@
-import re
+from __future__ import annotations
+
+import math
+from collections import Counter
 from typing import Optional
 
 from book_profile import extract_book_profile, profile_component_scores
-from metadata_normalizer import normalize_language_code, normalize_text
+from metadata_normalizer import (
+    canonicalize_title,
+    categories_match,
+    normalize_language_code,
+    normalize_person_name,
+    normalize_text,
+    tokenize_text,
+)
 from models import BookResponse, ScoredBook
+from taxonomy import taxonomy_profile, taxonomy_similarity
 
-# Stopwords PT + EN para extração de keywords da descrição
 _STOPWORDS = {
     "de", "a", "o", "e", "em", "um", "uma", "para", "com", "que", "do", "da",
     "dos", "das", "no", "na", "nos", "nas", "ao", "aos", "pelo", "pela", "ser",
     "foi", "ele", "ela", "seu", "sua", "como", "mais", "mas", "por", "se", "ou",
-    "the", "a", "an", "of", "in", "and", "to", "is", "it", "this", "that",
-    "his", "her", "with", "for", "on", "are", "was", "he", "she", "at", "be",
-    "have", "from", "not", "but", "they", "their", "when", "who", "which",
-    "book", "livro", "story", "historia", "novel", "romance",
+    "the", "an", "of", "in", "and", "to", "is", "it", "this", "that", "his", "her",
+    "with", "for", "on", "are", "was", "he", "she", "at", "be", "have", "from",
+    "not", "but", "they", "their", "when", "who", "which", "book", "livro", "story",
+    "historia", "novel", "romance", "edition", "edicao", "volume", "collection",
 }
 
 _GENERIC_CATEGORY_TERMS = {
@@ -26,135 +36,280 @@ _GENERIC_CATEGORY_TERMS = {
     "books",
 }
 
-# Pesos do scoring
-_WEIGHT_CATEGORY    = 0.24
-_WEIGHT_AUTHOR      = 0.14
-_WEIGHT_PAGES       = 0.10
-_WEIGHT_YEAR        = 0.08
-_WEIGHT_LANGUAGE    = 0.08
-_WEIGHT_TITLE       = 0.18
-_WEIGHT_DESCRIPTION = 0.12
-_WEIGHT_SPECIFICITY = 0.06
-_WEIGHT_THEME       = 0.20
+# O score final é uma compatibilidade calibrada, não a soma bruta dos sinais.
+# Componentes ausentes não valem zero; o denominador usa somente evidência disponível,
+# com um piso para impedir notas altas baseadas apenas em idioma, páginas ou ano.
+_SCORE_WEIGHTS = {
+    "taxonomy": 0.38,
+    "themes": 0.22,
+    "style": 0.12,
+    "text": 0.14,
+    "author": 0.07,
+    "year": 0.03,
+    "pages": 0.015,
+    "title": 0.015,
+    "language": 0.01,
+}
+_MIN_EVIDENCE_WEIGHT = 0.72
+_CALIBRATION_EXPONENT = 0.70
 
-# Penalidades por metadados ausentes
-_PENALTY_NO_PAGES = 0.08
-_PENALTY_NO_YEAR  = 0.04
-_PENALTY_GENERIC_ONLY = 0.06
-
-_PROFILE_COMPONENT_WEIGHTS = {
-    "themes": 0.36,
-    "narrative_markers": 0.18,
-    "category_kinds": 0.18,
-    "tones": 0.10,
-    "audiences": 0.08,
-    "pace_markers": 0.04,
-    "keywords": 0.06,
+_STYLE_COMPONENT_WEIGHTS = {
+    "narrative_markers": 0.36,
+    "tones": 0.30,
+    "audiences": 0.24,
+    "pace_markers": 0.10,
 }
 
 
 def keywords_from_description(description: str, top_n: int = 3) -> list[str]:
-    """Extrai as palavras mais frequentes da descrição, excluindo stopwords."""
-    words = re.findall(r'\b[a-zA-ZÀ-ú]{4,}\b', description.lower())
-    filtered = [w for w in words if w not in _STOPWORDS]
-    freq: dict[str, int] = {}
-    for w in filtered:
-        freq[w] = freq.get(w, 0) + 1
-    return sorted(freq, key=lambda w: freq[w], reverse=True)[:top_n]
-
-
-def token_similarity(a: str, b: str) -> float:
-    tokens_a = set(re.findall(r"\b[\wÀ-ú'-]{3,}\b", normalize_text(a)))
-    tokens_b = set(re.findall(r"\b[\wÀ-ú'-]{3,}\b", normalize_text(b)))
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
-
-
-def keyword_overlap_score(reference: BookResponse, book: BookResponse) -> float:
-    ref_keywords = set(keywords_from_description(reference.description, top_n=6))
-    book_keywords = set(keywords_from_description(book.description, top_n=6))
-    if not ref_keywords or not book_keywords:
-        return 0.0
-    return len(ref_keywords & book_keywords) / len(ref_keywords | book_keywords)
-
-
-def category_specificity_score(categories: set[str]) -> float:
-    if not categories:
-        return 0.0
-    specific = [category for category in categories if category not in _GENERIC_CATEGORY_TERMS]
-    return len(specific) / len(categories)
-
-
-def _profile_signal_strength(profile) -> float:
-    components = [
-        profile.themes,
-        profile.tones,
-        profile.narrative_markers,
-        profile.category_kinds,
-        profile.audiences,
-        profile.pace_markers,
-        profile.keywords,
+    words = [
+        token
+        for token in tokenize_text(description)
+        if len(token) >= 4 and token not in _STOPWORDS and not token.isdigit()
     ]
-    total_labels = sum(len(component) for component in components)
-    return min(total_labels / 14, 1.0)
+    frequencies = Counter(words)
+    return [word for word, _ in frequencies.most_common(top_n)]
 
 
-def _dynamic_profile_weight(
-    reference_category_specificity: float,
-    candidate_category_specificity: float,
-    description_overlap: float,
-    reference_profile_strength: float,
-    candidate_profile_strength: float,
-) -> float:
-    weight = _WEIGHT_THEME
-
-    average_specificity = (reference_category_specificity + candidate_category_specificity) / 2
-    average_profile_strength = (reference_profile_strength + candidate_profile_strength) / 2
-
-    if average_specificity < 0.35:
-        weight += 0.04
-    if average_profile_strength >= 0.45:
-        weight += 0.03
-    if description_overlap >= 0.20:
-        weight += 0.02
-
-    return min(weight, 0.30)
-
-
-def _compute_profile_score(reference_profile, candidate_profile) -> float:
-    component_scores = profile_component_scores(reference_profile, candidate_profile)
-    return sum(
-        component_scores[name] * weight
-        for name, weight in _PROFILE_COMPONENT_WEIGHTS.items()
+def _token_counter(value: str) -> Counter[str]:
+    return Counter(
+        token
+        for token in tokenize_text(value)
+        if len(token) >= 3 and token not in _STOPWORDS and not token.isdigit()
     )
 
 
-def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
-    """
-    Aplica filtros explicitos do usuario.
-    Filtros disponíveis: min_pages, max_pages, min_year, max_year, category, language,
-    exclude_same_author, reference_authors, exclude_title.
-    """
-    result = []
+def _cosine_similarity(left: Counter[str], right: Counter[str]) -> float:
+    if not left or not right:
+        return 0.0
+    common = set(left) & set(right)
+    numerator = sum(left[token] * right[token] for token in common)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def token_similarity(a: str, b: str) -> float:
+    return _cosine_similarity(_token_counter(a), _token_counter(b))
+
+
+def _book_keyword_counter(book: BookResponse) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    weighted_sources = (
+        (book.title or "", 2),
+        (book.description or "", 1),
+    )
+    for text, weight in weighted_sources:
+        for token, count in _token_counter(text).items():
+            counter[token] += count * weight
+    return counter
+
+
+def keyword_overlap_score(reference: BookResponse, book: BookResponse) -> float:
+    return _cosine_similarity(_book_keyword_counter(reference), _book_keyword_counter(book))
+
+
+def _raw_category_similarity(reference_categories: list[str], candidate_categories: list[str]) -> float:
+    reference = {normalize_text(category) for category in reference_categories if normalize_text(category)}
+    candidates = {normalize_text(category) for category in candidate_categories if normalize_text(category)}
+    if not reference or not candidates:
+        return 0.0
+
+    reference_specific = reference - _GENERIC_CATEGORY_TERMS
+    candidate_specific = candidates - _GENERIC_CATEGORY_TERMS
+    if not reference_specific and not candidate_specific:
+        return 0.18 if reference & candidates else 0.0
+    if not reference_specific or not candidate_specific:
+        return 0.0
+    reference = reference_specific
+    candidates = candidate_specific
+
+    matches = 0
+    unmatched = set(candidates)
+    for reference_category in reference:
+        match = next(
+            (
+                candidate
+                for candidate in unmatched
+                if categories_match(reference_category, [candidate])
+                or categories_match(candidate, [reference_category])
+            ),
+            None,
+        )
+        if match is not None:
+            matches += 1
+            unmatched.remove(match)
+
+    union_size = len(reference) + len(candidates) - matches
+    return matches / union_size if union_size else 0.0
+
+
+def category_overlap_score(reference_categories: list[str], candidate_categories: list[str]) -> float:
+    taxonomy_score = taxonomy_similarity(reference_categories, candidate_categories)
+    reference_profile = taxonomy_profile(reference_categories)
+    candidate_profile = taxonomy_profile(candidate_categories)
+    if reference_profile.all_ids and candidate_profile.all_ids:
+        return taxonomy_score
+    return _raw_category_similarity(reference_categories, candidate_categories)
+
+
+def _theme_similarity(reference_profile, candidate_profile) -> float:
+    if not reference_profile.themes or not candidate_profile.themes:
+        return 0.0
+    intersection = len(reference_profile.themes & candidate_profile.themes)
+    if not intersection:
+        return 0.0
+    jaccard = intersection / len(reference_profile.themes | candidate_profile.themes)
+    dice = (2 * intersection) / (len(reference_profile.themes) + len(candidate_profile.themes))
+    return jaccard * 0.62 + dice * 0.38
+
+
+def _style_similarity(reference_profile, candidate_profile) -> tuple[float, bool]:
+    component_scores = profile_component_scores(reference_profile, candidate_profile)
+    weighted_sum = 0.0
+    available_weight = 0.0
+
+    for component, weight in _STYLE_COMPONENT_WEIGHTS.items():
+        reference_values = getattr(reference_profile, component)
+        candidate_values = getattr(candidate_profile, component)
+        if not reference_values or not candidate_values:
+            continue
+        weighted_sum += component_scores[component] * weight
+        available_weight += weight
+
+    if not available_weight:
+        return 0.0, False
+    return weighted_sum / available_weight, True
+
+
+def _author_similarity(reference: BookResponse, book: BookResponse) -> float:
     reference_authors = {
-        normalize_text(author)
+        normalize_person_name(author)
+        for author in reference.authors
+        if normalize_person_name(author)
+    }
+    candidate_authors = {
+        normalize_person_name(author)
+        for author in book.authors
+        if normalize_person_name(author)
+    }
+    if not reference_authors or not candidate_authors:
+        return 0.0
+    if reference_authors & candidate_authors:
+        return 1.0
+
+    best = 0.0
+    for reference_author in reference_authors:
+        reference_tokens = set(reference_author.split())
+        for candidate_author in candidate_authors:
+            candidate_tokens = set(candidate_author.split())
+            if not reference_tokens or not candidate_tokens:
+                continue
+            overlap = len(reference_tokens & candidate_tokens) / max(len(reference_tokens), len(candidate_tokens))
+            best = max(best, overlap)
+    return best if best >= 0.75 else 0.0
+
+
+def _linear_proximity(reference_value: int, candidate_value: int, tolerance: int) -> float:
+    return max(0.0, 1.0 - abs(reference_value - candidate_value) / tolerance)
+
+
+def score_book_components(book: BookResponse, reference: BookResponse) -> dict[str, Optional[float]]:
+    reference_profile = extract_book_profile(reference)
+    candidate_profile = extract_book_profile(book)
+    reference_taxonomy = taxonomy_profile(reference.categories)
+    candidate_taxonomy = taxonomy_profile(book.categories)
+
+    taxonomy_available = bool(
+        (reference_taxonomy.all_ids and candidate_taxonomy.all_ids)
+        or (reference.categories and book.categories)
+    )
+    themes_available = bool(reference_profile.themes and candidate_profile.themes)
+    style_score, style_available = _style_similarity(reference_profile, candidate_profile)
+    text_available = bool(_book_keyword_counter(reference) and _book_keyword_counter(book))
+    author_available = bool(reference.authors and book.authors)
+    year_available = reference.published_year is not None and book.published_year is not None
+    pages_available = reference.page_count is not None and book.page_count is not None
+    title_available = bool(reference.title and book.title)
+    reference_language = normalize_language_code(reference.language)
+    candidate_language = normalize_language_code(book.language)
+    language_available = bool(reference_language and candidate_language)
+
+    return {
+        "taxonomy": category_overlap_score(reference.categories, book.categories) if taxonomy_available else None,
+        "themes": _theme_similarity(reference_profile, candidate_profile) if themes_available else None,
+        "style": style_score if style_available else None,
+        "text": keyword_overlap_score(reference, book) if text_available else None,
+        "author": _author_similarity(reference, book) if author_available else None,
+        "year": (
+            _linear_proximity(reference.published_year, book.published_year, 60)
+            if year_available
+            else None
+        ),
+        "pages": (
+            _linear_proximity(reference.page_count, book.page_count, 600)
+            if pages_available
+            else None
+        ),
+        "title": token_similarity(reference.title, book.title) if title_available else None,
+        "language": (1.0 if reference_language == candidate_language else 0.0) if language_available else None,
+    }
+
+
+def _calibrate_score(components: dict[str, Optional[float]]) -> float:
+    weighted_sum = 0.0
+    available_weight = 0.0
+    semantic_sum = 0.0
+
+    for name, weight in _SCORE_WEIGHTS.items():
+        value = components.get(name)
+        if value is None:
+            continue
+        bounded_value = min(1.0, max(0.0, value))
+        contribution = bounded_value * weight
+        weighted_sum += contribution
+        available_weight += weight
+        if name in {"taxonomy", "themes", "style", "text"}:
+            semantic_sum += contribution
+
+    if not available_weight or not weighted_sum:
+        return 0.0
+
+    raw_score = weighted_sum / max(_MIN_EVIDENCE_WEIGHT, available_weight)
+    calibrated = min(1.0, max(0.0, raw_score)) ** _CALIBRATION_EXPONENT
+
+    # Sem qualquer relação temática/textual, contexto editorial não deve produzir
+    # uma recomendação forte por coincidência de idioma, páginas ou período.
+    if semantic_sum < 0.025:
+        calibrated = min(calibrated, 0.32)
+
+    return round(calibrated, 4)
+
+
+def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]:
+    result: list[BookResponse] = []
+    reference_authors = {
+        normalize_person_name(author)
         for author in filters.get("reference_authors", [])
         if author
     }
+    include_unknown_metadata = bool(filters.get("include_unknown_metadata", False))
+    excluded_title = canonicalize_title(filters.get("exclude_title", ""))
 
     for book in books:
-        if filters.get("exclude_title"):
-            if normalize_text(book.title) == normalize_text(filters["exclude_title"]):
+        if excluded_title and canonicalize_title(book.title) == excluded_title:
+            candidate_authors = {
+                normalize_person_name(author)
+                for author in book.authors
+                if author
+            }
+            if not reference_authors or candidate_authors & reference_authors:
                 continue
 
-        if filters.get("category"):
-            requested_category = normalize_text(filters["category"])
-            categories = [normalize_text(category) for category in book.categories]
-            if requested_category and not any(
-                requested_category in category for category in categories
-            ):
-                continue
+        if filters.get("category") and not categories_match(filters["category"], book.categories):
+            continue
 
         if filters.get("language"):
             requested_language = normalize_language_code(filters["language"])
@@ -163,22 +318,34 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
                 continue
 
         if filters.get("exclude_same_author") and reference_authors:
-            candidate_authors = {normalize_text(author) for author in book.authors if author}
-            if candidate_authors and candidate_authors & reference_authors:
+            candidate_authors = {
+                normalize_person_name(author)
+                for author in book.authors
+                if author
+            }
+            if candidate_authors & reference_authors:
                 continue
 
-        if filters.get("min_pages") and book.page_count:
-            if book.page_count < filters["min_pages"]:
+        if filters.get("min_pages") is not None:
+            if book.page_count is None and not include_unknown_metadata:
                 continue
-        if filters.get("max_pages") and book.page_count:
-            if book.page_count > filters["max_pages"]:
+            if book.page_count is not None and book.page_count < filters["min_pages"]:
+                continue
+        if filters.get("max_pages") is not None:
+            if book.page_count is None and not include_unknown_metadata:
+                continue
+            if book.page_count is not None and book.page_count > filters["max_pages"]:
                 continue
 
-        if filters.get("min_year") and book.published_year:
-            if book.published_year < filters["min_year"]:
+        if filters.get("min_year") is not None:
+            if book.published_year is None and not include_unknown_metadata:
                 continue
-        if filters.get("max_year") and book.published_year:
-            if book.published_year > filters["max_year"]:
+            if book.published_year is not None and book.published_year < filters["min_year"]:
+                continue
+        if filters.get("max_year") is not None:
+            if book.published_year is None and not include_unknown_metadata:
+                continue
+            if book.published_year is not None and book.published_year > filters["max_year"]:
                 continue
 
         result.append(book)
@@ -187,95 +354,31 @@ def filter_books(books: list[BookResponse], filters: dict) -> list[BookResponse]
 
 
 def score_books(books: list[BookResponse], reference: BookResponse) -> list[ScoredBook]:
-    """
-    Pontua livros por similaridade com o livro de referência.
-
-    Critérios e pesos:
-    - Categoria em comum  : 0.24  (Jaccard sobre conjuntos de categorias)
-    - Autor em comum      : 0.14  (bonus binario, sem dominar o ranking)
-    - Proximidade paginas : 0.10  (diferenca ate 500 paginas, escala linear)
-    - Proximidade ano     : 0.08  (diferenca ate 30 anos, escala linear)
-    - Idioma igual        : 0.08
-    - Similaridade título : 0.18
-    - Keywords descricao  : 0.12
-    - Categories especificas: 0.06
-    - Perfil tematico     : 0.20
-
-    Penalidades aplicadas quando metadados estão ausentes no candidato:
-    - Sem page_count      : -0.08
-    - Sem published_year  : -0.04
-    - Apenas categorias genericas: -0.06
-    """
-    ref_cats    = {normalize_text(c) for c in reference.categories}
-    ref_authors = {normalize_text(a) for a in reference.authors}
-    ref_language = normalize_language_code(reference.language)
-    reference_profile = extract_book_profile(reference)
-    reference_category_specificity = category_specificity_score(ref_cats)
-    reference_profile_strength = _profile_signal_strength(reference_profile)
-
-    scored = []
+    """Pontua compatibilidade em 0.0-1.0, normalizando metadados ausentes."""
+    scored: list[ScoredBook] = []
+    total_weight = sum(_SCORE_WEIGHTS.values())
 
     for book in books:
-        score = 0.0
-
-        # --- categoria (0.35) ---
-        book_cats = {normalize_text(c) for c in book.categories}
-        if ref_cats and book_cats:
-            overlap = len(ref_cats & book_cats) / len(ref_cats | book_cats)
-            score += overlap * _WEIGHT_CATEGORY
-        elif not ref_cats and not book_cats:
-            # ambos sem categoria: neutro, nao penaliza nem bonifica
-            score += _WEIGHT_CATEGORY * 0.5
-
-        # --- autor (0.30) ---
-        book_authors = {normalize_text(a) for a in book.authors}
-        if ref_authors and book_authors and (ref_authors & book_authors):
-            score += _WEIGHT_AUTHOR
-
-        # --- paginas (0.10) ---
-        if reference.page_count and book.page_count:
-            diff = abs(reference.page_count - book.page_count)
-            score += max(0.0, 1.0 - diff / 500) * _WEIGHT_PAGES
-        elif not book.page_count:
-            score -= _PENALTY_NO_PAGES
-
-        # --- ano (0.08) ---
-        if reference.published_year and book.published_year:
-            diff = abs(reference.published_year - book.published_year)
-            score += max(0.0, 1.0 - diff / 30) * _WEIGHT_YEAR
-        elif not book.published_year:
-            score -= _PENALTY_NO_YEAR
-
-        # --- idioma (0.08) ---
-        if ref_language and normalize_language_code(book.language) == ref_language:
-            score += _WEIGHT_LANGUAGE
-
-        # --- título (0.18) ---
-        score += token_similarity(reference.title, book.title) * _WEIGHT_TITLE
-
-        # --- descricao (0.12) ---
-        description_overlap = keyword_overlap_score(reference, book)
-        score += description_overlap * _WEIGHT_DESCRIPTION
-
-        # --- especificidade de categorias (0.06) ---
-        specificity = category_specificity_score(book_cats)
-        score += specificity * _WEIGHT_SPECIFICITY
-        if book_cats and specificity == 0.0:
-            score -= _PENALTY_GENERIC_ONLY
-
-        # --- semantic profile (dynamic weight) ---
-        candidate_profile = extract_book_profile(book)
-        candidate_profile_strength = _profile_signal_strength(candidate_profile)
-        profile_weight = _dynamic_profile_weight(
-            reference_category_specificity=reference_category_specificity,
-            candidate_category_specificity=specificity,
-            description_overlap=description_overlap,
-            reference_profile_strength=reference_profile_strength,
-            candidate_profile_strength=candidate_profile_strength,
+        components = score_book_components(book, reference)
+        score = _calibrate_score(components)
+        available_weight = sum(
+            _SCORE_WEIGHTS[name]
+            for name, value in components.items()
+            if value is not None
         )
-        score += _compute_profile_score(reference_profile, candidate_profile) * profile_weight
+        serialized_components = {
+            name: round(min(1.0, max(0.0, value)), 4)
+            for name, value in components.items()
+            if value is not None
+        }
+        scored.append(
+            ScoredBook(
+                **book.model_dump(),
+                score=score,
+                score_components=serialized_components,
+                score_coverage=round(available_weight / total_weight, 4),
+            )
+        )
 
-        scored.append(ScoredBook(**book.model_dump(), score=round(max(0.0, score), 4)))
-
-    scored.sort(key=lambda book: book.score, reverse=True)
+    scored.sort(key=lambda candidate: candidate.score, reverse=True)
     return scored
